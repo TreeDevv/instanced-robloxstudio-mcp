@@ -111,7 +111,7 @@ If you encounter issues, you may need to run it through `cmd`. Update your confi
 - Install MCP server using commands above
 
 ### Connection Issues
-- Check Windows Firewall isn't blocking localhost:58741
+- Check Windows Firewall isn't blocking localhost ports (starting at 58741)
 - Restart both Studio and your AI assistant
 - Check Studio Output window for detailed error messages
 
@@ -128,10 +128,12 @@ If you encounter issues, you may need to run it through `cmd`. Update your confi
 - **Real-time status**: Visual connection indicators
 - **Smart polling**: Exponential backoff for failed connections
 - **Error recovery**: Automatic retry with timeout handling
+- **Multi-instance discovery**: Finds running MCP servers across many ports (not limited to 5)
+- **Server context panel**: Shows running MCP servers, active context, and connected place metadata
 - **Debug friendly**: Comprehensive logging in Output window
 
 ### Customization
-- **Server URL**: Modify in plugin UI (default: http://localhost:58741)
+- **Server URL**: Modify in plugin UI (default base: http://localhost:58741)
 - **Poll interval**: 500ms default (editable in code)
 - **Timeout settings**: 30-second request timeouts
 

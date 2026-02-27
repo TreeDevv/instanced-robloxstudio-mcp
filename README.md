@@ -33,6 +33,22 @@ gemini mcp add robloxstudio npx --trust -- -y robloxstudio-mcp@latest
 
 Plugin shows "Connected" when ready.
 
+## Multi-Instance Support
+
+- Each MCP process now auto-binds to the next free port starting at `58741` (or `ROBLOX_STUDIO_PORT`).
+- Port scan upper bound is configurable with `ROBLOX_STUDIO_MAX_PORT` (default `65535`).
+- On startup, the server prints a machine-readable line:
+
+```text
+MCP_INSTANCE_STARTED {"instanceId":"...","host":"0.0.0.0","port":58741,"pid":12345}
+```
+
+- Running instances are tracked in a shared local registry (temp directory by default).
+- New MCP tools:
+  - `list_mcp_instances`
+  - `get_mcp_instance_context`
+- Plugin UI now shows running servers, plugin connection state, and connected place context.
+
 <details>
 <summary>Other MCP clients (Claude Desktop, Cursor, etc.)</summary>
 
@@ -66,6 +82,6 @@ Ask things like: *"What's the structure of this game?"*, *"Find scripts with dep
 
 ---
 
-**v1.9.0** — 37+ tools, asset property fetching, full HTTP API, improved stability
+**v2.3.0** - 39+ tools, multi-instance support, shared context registry, improved plugin observability
 
 [Report Issues](https://github.com/boshyxd/robloxstudio-mcp/issues) | [DevForum](https://devforum.roblox.com/t/v180-roblox-studio-mcp-speed-up-your-workflow-by-letting-ai-read-paths-and-properties/3707071) | MIT Licensed

@@ -1,0 +1,10 @@
+{
+  "name": "AmbientSpawnPlugin",
+  "tree": {
+    "$className": "Script",
+    "$path": "plugin.server.lua",
+    "src": {
+      "$path": "src"
+    }
+  }
+}

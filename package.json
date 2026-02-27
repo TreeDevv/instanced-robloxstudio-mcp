@@ -15,6 +15,7 @@
   "scripts": {
     "build": "tsc",
     "build:plugin": "node scripts/build-plugin.mjs",
+    "build:ambient-plugin": "node scripts/build-ambient-plugin.mjs",
     "build:all": "npm run build && npm run build:plugin",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",

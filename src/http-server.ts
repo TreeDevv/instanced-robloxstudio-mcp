@@ -2,14 +2,97 @@ import express from 'express';
 import cors from 'cors';
 import { RobloxStudioTools } from './tools/index.js';
 import { BridgeService } from './bridge-service.js';
+import { InstanceRegistry, InstanceRegistryEntry, PluginMetadata } from './instance-registry.js';
 
-export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService) {
+export interface HttpServerContext {
+  instanceId: string;
+  host: string;
+  port: number;
+  registry: InstanceRegistry;
+}
+
+interface CurrentContextSnapshot {
+  instanceId: string | null;
+  host: string | null;
+  port: number | null;
+  pluginConnected: boolean;
+  mcpServerActive: boolean;
+  pluginMetadata: PluginMetadata | null;
+}
+
+export function createHttpServer(
+  tools: RobloxStudioTools,
+  bridge: BridgeService,
+  context?: HttpServerContext
+) {
   const app = express();
   let pluginConnected = false;
   let mcpServerActive = false;
   let lastMCPActivity = 0;
   let mcpServerStartTime = 0;
   let lastPluginActivity = 0;
+  let pluginMetadata: PluginMetadata | undefined;
+  let binding = context
+    ? {
+      instanceId: context.instanceId,
+      host: context.host,
+      port: context.port,
+    }
+    : null;
+
+  const parsePluginMetadata = (body: any): PluginMetadata | undefined => {
+    if (!body || typeof body !== 'object') {
+      return undefined;
+    }
+
+    const metadata: PluginMetadata = {
+      updatedAt: Date.now(),
+    };
+
+    if (typeof body.placeName === 'string' && body.placeName.length > 0) {
+      metadata.placeName = body.placeName;
+    }
+    if (typeof body.placeId === 'number' && Number.isFinite(body.placeId)) {
+      metadata.placeId = body.placeId;
+    }
+    if (typeof body.gameId === 'string' && body.gameId.length > 0) {
+      metadata.gameId = body.gameId;
+    }
+    if (typeof body.jobId === 'string' && body.jobId.length > 0) {
+      metadata.jobId = body.jobId;
+    }
+
+    if (!metadata.placeName && metadata.placeId === undefined && !metadata.gameId && !metadata.jobId) {
+      return undefined;
+    }
+
+    return metadata;
+  };
+
+  const getCurrentContextSnapshot = (): CurrentContextSnapshot => ({
+    instanceId: binding?.instanceId ?? null,
+    host: binding?.host ?? null,
+    port: binding?.port ?? null,
+    pluginConnected: isPluginConnected(),
+    mcpServerActive: isMCPServerActive(),
+    pluginMetadata: pluginMetadata ?? null,
+  });
+
+  const syncRegistryState = async () => {
+    if (!context?.registry || !binding) {
+      return;
+    }
+
+    await context.registry.heartbeat(binding.instanceId, {
+      pid: process.pid,
+      host: binding.host,
+      port: binding.port,
+      mcpServerActive: isMCPServerActive(),
+      pluginConnected: isPluginConnected(),
+      lastPluginActivity,
+      pluginMetadata: pluginMetadata ?? null,
+    });
+  };
 
 
   const setMCPServerActive = (active: boolean) => {
@@ -21,12 +104,14 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
       mcpServerStartTime = 0;
       lastMCPActivity = 0;
     }
+    void syncRegistryState();
   };
 
   const trackMCPActivity = () => {
     if (mcpServerActive) {
       lastMCPActivity = Date.now();
     }
+    void syncRegistryState();
   };
 
   const isMCPServerActive = () => {
@@ -52,26 +137,41 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
       service: 'robloxstudio-mcp',
       pluginConnected,
       mcpServerActive: isMCPServerActive(),
-      uptime: mcpServerActive ? Date.now() - mcpServerStartTime : 0
+      uptime: mcpServerActive ? Date.now() - mcpServerStartTime : 0,
+      instanceId: binding?.instanceId ?? null,
+      host: binding?.host ?? null,
+      port: binding?.port ?? null,
+      currentContext: getCurrentContextSnapshot(),
     });
   });
 
 
-  app.post('/ready', (req, res) => {
+  app.post('/ready', async (req, res) => {
+    try {
+      bridge.clearAllPendingRequests();
+      pluginConnected = true;
+      lastPluginActivity = Date.now();
+      pluginMetadata = parsePluginMetadata(req.body);
 
-
-    bridge.clearAllPendingRequests();
-    pluginConnected = true;
-    lastPluginActivity = Date.now();
-    res.json({ success: true });
+      await syncRegistryState();
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+    }
   });
 
 
-  app.post('/disconnect', (req, res) => {
-    pluginConnected = false;
+  app.post('/disconnect', async (req, res) => {
+    try {
+      pluginConnected = false;
+      pluginMetadata = undefined;
 
-    bridge.clearAllPendingRequests();
-    res.json({ success: true });
+      bridge.clearAllPendingRequests();
+      await syncRegistryState();
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+    }
   });
 
 
@@ -80,8 +180,71 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
       pluginConnected: isPluginConnected(),
       mcpServerActive: isMCPServerActive(),
       lastMCPActivity,
-      uptime: mcpServerActive ? Date.now() - mcpServerStartTime : 0
+      uptime: mcpServerActive ? Date.now() - mcpServerStartTime : 0,
+      instanceId: binding?.instanceId ?? null,
+      host: binding?.host ?? null,
+      port: binding?.port ?? null,
+      pluginMetadata: pluginMetadata ?? null,
+      currentContext: getCurrentContextSnapshot(),
     });
+  });
+
+  app.get('/registry/instances', async (req, res) => {
+    try {
+      if (!context?.registry) {
+        const currentContext = getCurrentContextSnapshot();
+        const fallbackInstance = currentContext.instanceId
+          ? [{
+            ...currentContext,
+            startedAt: 0,
+            lastSeenAt: Date.now(),
+            pid: process.pid,
+            lastPluginActivity,
+            isCurrentContext: true,
+          }]
+          : [];
+
+        res.json({
+          currentInstanceId: currentContext.instanceId,
+          instances: fallbackInstance,
+        });
+        return;
+      }
+
+      const instances = await context.registry.listInstances();
+      const payload = instances.map((instance) => ({
+        ...instance,
+        isCurrentContext: instance.instanceId === binding?.instanceId,
+      }));
+
+      res.json({
+        currentInstanceId: binding?.instanceId ?? null,
+        instances: payload,
+      });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+    }
+  });
+
+  app.get('/registry/current', async (req, res) => {
+    try {
+      if (!context?.registry || !binding) {
+        res.json({
+          instance: getCurrentContextSnapshot(),
+        });
+        return;
+      }
+
+      const current = await context.registry.getInstance(binding.instanceId);
+      const snapshot: InstanceRegistryEntry | CurrentContextSnapshot = current ?? getCurrentContextSnapshot();
+
+      res.json({
+        instance: snapshot,
+        isCurrentContext: true,
+      });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
+    }
   });
 
 
@@ -91,6 +254,7 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
       pluginConnected = true;
     }
     lastPluginActivity = Date.now();
+    void syncRegistryState();
 
     if (!isMCPServerActive()) {
       res.status(503).json({
@@ -517,6 +681,15 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
   (app as any).setMCPServerActive = setMCPServerActive;
   (app as any).isMCPServerActive = isMCPServerActive;
   (app as any).trackMCPActivity = trackMCPActivity;
+  (app as any).getCurrentContext = getCurrentContextSnapshot;
+  (app as any).setInstanceBinding = (nextBinding: { instanceId: string; host: string; port: number }) => {
+    binding = {
+      instanceId: nextBinding.instanceId,
+      host: nextBinding.host,
+      port: nextBinding.port,
+    };
+    void syncRegistryState();
+  };
 
   return app;
 }

@@ -1,0 +1,2121 @@
+<?xml version="1.0" encoding="utf-8"?>
+<roblox version="4">
+  <Item class="Script" referent="0">
+    <Properties>
+      <string name="Name">AmbientSpawnPlugin</string>
+      <token name="RunContext">0</token>
+      <string name="Source"><![CDATA[local Selection = game:GetService("Selection")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+
+local Source = script:WaitForChild("src")
+
+local Constants = require(Source:WaitForChild("Constants"))
+local State = require(Source:WaitForChild("State"))
+local EnemySource = require(Source:WaitForChild("EnemySource"))
+local NodeService = require(Source:WaitForChild("NodeService"))
+local PreviewService = require(Source:WaitForChild("PreviewService"))
+local UI = require(Source:WaitForChild("UI"))
+
+local toolbar = plugin:CreateToolbar(Constants.TOOLBAR_NAME)
+local toolbarButton = toolbar:CreateButton(
+	Constants.TOOLBAR_BUTTON_NAME,
+	Constants.TOOLBAR_BUTTON_TOOLTIP,
+	Constants.TOOLBAR_BUTTON_ICON
+)
+
+local enemyTypes = EnemySource.GetEnemyTypes(false)
+if #enemyTypes <= 0 then
+	enemyTypes = EnemySource.GetFallbackEnemyTypes()
+end
+State.SetEnemyTypes(enemyTypes)
+
+local ui = nil
+local selectionChangedConnection = nil
+local onUndoConnection = nil
+local onRedoConnection = nil
+
+local function getSelectedNodes()
+	return NodeService.GetSelectedNodes()
+end
+
+local function updatePreview()
+	local records = NodeService.BuildPreviewRecords(State.GetSelectedNodes())
+	PreviewService.SetOptions(State.GetShowRadiusPreview(), State.GetShowMarkerPreview())
+	PreviewService.Render(records)
+end
+
+local function refreshSelectionModel()
+	local nodes = getSelectedNodes()
+	State.SetSelectedNodes(nodes)
+	local model = NodeService.BuildSelectionModel(nodes, State.GetEnemyTypes())
+	if ui then
+		ui:UpdateFromSelection(model)
+	end
+	updatePreview()
+end
+
+local function showActionResult(prefix, changedCount)
+	if not ui then
+		return
+	end
+	local suffix = if changedCount == 1 then "node" else "nodes"
+	ui:ShowToast(string.format("%s %d %s", prefix, changedCount, suffix))
+end
+
+ui = UI.new(plugin, State.GetEnemyTypes(), {
+	CreateNode = function()
+		local createdPart, err = NodeService.CreateNode()
+		if createdPart then
+			ui:ShowToast("Created ambient spawn node")
+			refreshSelectionModel()
+		else
+			ui:ShowToast("Create failed: " .. tostring(err), Constants.COLOR_ERROR)
+		end
+	end,
+	TagSelection = function()
+		local changedCount = NodeService.TagSelection()
+		showActionResult("Tagged", changedCount)
+		refreshSelectionModel()
+	end,
+	UntagSelection = function()
+		local changedCount = NodeService.UntagSelection()
+		showActionResult("Untagged", changedCount)
+		refreshSelectionModel()
+	end,
+	SetEnabled = function(enabledValue)
+		local changedCount = NodeService.ApplyAttribute(State.GetSelectedNodes(), "Enabled", enabledValue, {
+			SkipWaypoint = false,
+			WaypointName = "Ambient Spawn: Enabled",
+		})
+		if changedCount > 0 then
+			refreshSelectionModel()
+		end
+	end,
+	SetNumber = function(attributeName, numberValue, isLive)
+		local changedCount = NodeService.ApplyAttribute(State.GetSelectedNodes(), attributeName, numberValue, {
+			SkipWaypoint = isLive == true,
+			WaypointName = "Ambient Spawn: " .. tostring(attributeName),
+		})
+		if changedCount > 0 then
+			refreshSelectionModel()
+		end
+	end,
+	StepNumber = function(attributeName, deltaValue)
+		local changedCount = NodeService.StepAttribute(State.GetSelectedNodes(), attributeName, deltaValue)
+		if changedCount > 0 then
+			refreshSelectionModel()
+		end
+	end,
+	ToggleEnemy = function(enemyName, shouldEnable)
+		local changedCount = NodeService.ToggleEnemy(State.GetSelectedNodes(), enemyName, shouldEnable)
+		if changedCount > 0 then
+			refreshSelectionModel()
+		end
+	end,
+	ApplyPreset = function(presetName)
+		local changedCount = NodeService.ApplyPreset(State.GetSelectedNodes(), presetName)
+		if changedCount > 0 then
+			ui:ShowToast("Applied preset: " .. tostring(presetName))
+			refreshSelectionModel()
+		end
+	end,
+	SetRadiusPreview = function(enabledValue)
+		State.SetShowRadiusPreview(enabledValue)
+		updatePreview()
+	end,
+	SetMarkerPreview = function(enabledValue)
+		State.SetShowMarkerPreview(enabledValue)
+		updatePreview()
+	end,
+	ReloadEnemyTypes = function()
+		local loaded = EnemySource.GetEnemyTypes(true)
+		if #loaded <= 0 then
+			loaded = EnemySource.GetFallbackEnemyTypes()
+		end
+		State.SetEnemyTypes(loaded)
+		ui:SetEnemyTypes(loaded)
+		ui:ShowToast("Reloaded enemy types")
+		refreshSelectionModel()
+	end,
+	RequestRefresh = function()
+		refreshSelectionModel()
+	end,
+})
+
+ui:SetPreviewState(State.GetShowRadiusPreview(), State.GetShowMarkerPreview())
+refreshSelectionModel()
+
+selectionChangedConnection = Selection.SelectionChanged:Connect(function()
+	refreshSelectionModel()
+end)
+
+do
+	local okUndo, undoOrErr = pcall(function()
+		return ChangeHistoryService.OnUndo:Connect(function()
+			refreshSelectionModel()
+		end)
+	end)
+	if okUndo then
+		onUndoConnection = undoOrErr
+	end
+end
+
+do
+	local okRedo, redoOrErr = pcall(function()
+		return ChangeHistoryService.OnRedo:Connect(function()
+			refreshSelectionModel()
+		end)
+	end)
+	if okRedo then
+		onRedoConnection = redoOrErr
+	end
+end
+
+toolbarButton.Click:Connect(function()
+	if ui then
+		ui:SetWidgetEnabled(not ui:GetWidgetEnabled())
+	end
+end)
+
+plugin.Unloading:Connect(function()
+	if selectionChangedConnection then
+		selectionChangedConnection:Disconnect()
+		selectionChangedConnection = nil
+	end
+	if onUndoConnection then
+		onUndoConnection:Disconnect()
+		onUndoConnection = nil
+	end
+	if onRedoConnection then
+		onRedoConnection:Disconnect()
+		onRedoConnection = nil
+	end
+
+	PreviewService.Destroy()
+
+	if ui then
+		ui:Destroy()
+		ui = nil
+	end
+end)
+]]></string>
+    </Properties>
+    <Item class="Folder" referent="1">
+      <Properties>
+        <string name="Name">src</string>
+      </Properties>
+      <Item class="ModuleScript" referent="2">
+        <Properties>
+          <string name="Name">Constants</string>
+          <string name="Source"><![CDATA[local Constants = {}
+
+Constants.TOOLBAR_NAME = "Ambient Tools"
+Constants.TOOLBAR_BUTTON_NAME = "Ambient Spawns"
+Constants.TOOLBAR_BUTTON_TOOLTIP = "Create and tune ambient enemy spawn nodes"
+Constants.TOOLBAR_BUTTON_ICON = "rbxassetid://10734944444"
+
+Constants.WIDGET_ID = "AmbientSpawnAuthoringWidget"
+Constants.WIDGET_TITLE = "Ambient Spawn Authoring"
+
+Constants.NODE_TAG = "EnemySpawnNode"
+Constants.NODE_NAME = "EnemySpawnNode"
+Constants.NODE_PARENT_PATH = "Workspace.Map.Islands.EnemyNodes"
+Constants.PREVIEW_FOLDER_NAME = "__AmbientSpawnPreview"
+
+Constants.DEFAULT_ENEMY_POOL = { "Guard", "Thieve" }
+
+Constants.DEFAULT_ATTRIBUTES = {
+	Enabled = true,
+	Radius = 45,
+	EnemyWeight = 1,
+	MaxAlive = 4,
+	RespawnMin = 6,
+	RespawnMax = 12,
+	ActivationDistance = 220,
+	MinSpawnDistanceFromPlayer = 25,
+	IslandName = "",
+	EnemyPool = "Guard,Thieve",
+}
+
+Constants.NUMERIC_FIELD_ORDER = {
+	"Radius",
+	"EnemyWeight",
+	"MaxAlive",
+	"RespawnMin",
+	"RespawnMax",
+	"ActivationDistance",
+	"MinSpawnDistanceFromPlayer",
+}
+
+Constants.NUMERIC_FIELDS = {
+	Radius = { Min = 8, Max = 1024, Step = 1, Precision = 0 },
+	EnemyWeight = { Min = 0.25, Max = 3, Step = 0.05, Precision = 2 },
+	MaxAlive = { Min = 1, Max = 40, Step = 1, Precision = 0 },
+	RespawnMin = { Min = 0.5, Max = 120, Step = 0.5, Precision = 2 },
+	RespawnMax = { Min = 0.5, Max = 180, Step = 0.5, Precision = 2 },
+	ActivationDistance = { Min = 16, Max = 2048, Step = 4, Precision = 0 },
+	MinSpawnDistanceFromPlayer = { Min = 0, Max = 300, Step = 1, Precision = 0 },
+}
+
+Constants.PRESETS = {
+	Scout = {
+		Radius = 35,
+		EnemyWeight = 0.8,
+		MaxAlive = 2,
+		RespawnMin = 7,
+		RespawnMax = 12,
+		ActivationDistance = 180,
+		MinSpawnDistanceFromPlayer = 24,
+	},
+	Standard = {
+		Radius = 45,
+		EnemyWeight = 1,
+		MaxAlive = 4,
+		RespawnMin = 6,
+		RespawnMax = 12,
+		ActivationDistance = 220,
+		MinSpawnDistanceFromPlayer = 25,
+	},
+	Heavy = {
+		Radius = 60,
+		EnemyWeight = 1.8,
+		MaxAlive = 6,
+		RespawnMin = 3,
+		RespawnMax = 7,
+		ActivationDistance = 280,
+		MinSpawnDistanceFromPlayer = 28,
+	},
+}
+
+Constants.COLOR_SUCCESS = Color3.fromRGB(70, 205, 125)
+Constants.COLOR_WARNING = Color3.fromRGB(246, 186, 65)
+Constants.COLOR_ERROR = Color3.fromRGB(235, 104, 104)
+
+return Constants
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">EnemySource</string>
+          <string name="Source"><![CDATA[local ServerScriptService = game:GetService("ServerScriptService")
+
+local Constants = require(script.Parent.Constants)
+local Util = require(script.Parent.Util)
+
+local EnemySource = {}
+
+local cachedEnemyTypes = nil
+local cachedFallbackPool = nil
+
+local function parseEnemyNamesFromSource(sourceText)
+	if type(sourceText) ~= "string" or sourceText == "" then
+		return {}
+	end
+
+	local startPos, openBracePos = string.find(sourceText, "local%s+ENEMIES%s*=%s*{")
+	if not startPos or not openBracePos then
+		return {}
+	end
+
+	local depth = 0
+	local closePos = nil
+	for index = openBracePos, #sourceText do
+		local currentChar = string.sub(sourceText, index, index)
+		if currentChar == "{" then
+			depth += 1
+		elseif currentChar == "}" then
+			depth -= 1
+			if depth == 0 then
+				closePos = index
+				break
+			end
+		end
+	end
+
+	if not closePos then
+		return {}
+	end
+
+	local blockText = string.sub(sourceText, openBracePos + 1, closePos - 1)
+	local names = {}
+	for line in string.gmatch(blockText, "[^\r\n]+") do
+		local entryName = string.match(line, "^%s*([%a_][%w_]*)%s*=%s*{%s*$")
+		if entryName then
+			table.insert(names, entryName)
+		end
+	end
+
+	return names
+end
+
+local function getCatalogModule()
+	local modulesFolder = ServerScriptService:FindFirstChild("Modules")
+	if not modulesFolder then
+		return nil
+	end
+	local enemyFolder = modulesFolder:FindFirstChild("Enemy")
+	if not enemyFolder then
+		return nil
+	end
+	local catalog = enemyFolder:FindFirstChild("EnemyCatalog")
+	if catalog and catalog:IsA("ModuleScript") then
+		return catalog
+	end
+	return nil
+end
+
+local function loadFromCatalogModule()
+	local catalogModule = getCatalogModule()
+	if not catalogModule then
+		return {}
+	end
+
+	local sourceText = nil
+	local ok, resultOrErr = pcall(function()
+		return catalogModule.Source
+	end)
+	if ok then
+		sourceText = resultOrErr
+	end
+
+	local parsed = parseEnemyNamesFromSource(sourceText)
+	if #parsed > 0 then
+		table.sort(parsed)
+		return Util.DedupeArray(parsed)
+	end
+
+	return {}
+end
+
+local function loadFallbackPool()
+	if cachedFallbackPool then
+		return Util.CloneArray(cachedFallbackPool)
+	end
+
+	local pool = Util.CloneArray(Constants.DEFAULT_ENEMY_POOL)
+	local catalogModule = getCatalogModule()
+
+	if catalogModule then
+		local ok, catalogOrErr = pcall(function()
+			return require(catalogModule)
+		end)
+		if ok and type(catalogOrErr) == "table" and type(catalogOrErr.GetPool) == "function" then
+			local okPool, ambientPool = pcall(function()
+				return catalogOrErr.GetPool("Ambient")
+			end)
+			if okPool and type(ambientPool) == "table" and #ambientPool > 0 then
+				pool = Util.DedupeArray(ambientPool)
+			end
+		end
+	end
+
+	cachedFallbackPool = pool
+	return Util.CloneArray(pool)
+end
+
+function EnemySource.GetFallbackEnemyTypes()
+	local fallback = loadFallbackPool()
+	table.sort(fallback)
+	return fallback
+end
+
+function EnemySource.GetEnemyTypes(forceRefresh)
+	if cachedEnemyTypes and forceRefresh ~= true then
+		return Util.CloneArray(cachedEnemyTypes)
+	end
+
+	local names = loadFromCatalogModule()
+
+	if #names <= 0 then
+		local fallback = loadFallbackPool()
+		names = Util.DedupeArray(fallback)
+	end
+
+	table.sort(names)
+	cachedEnemyTypes = names
+	return Util.CloneArray(names)
+end
+
+return EnemySource
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="4">
+        <Properties>
+          <string name="Name">NodeService</string>
+          <string name="Source"><![CDATA[local CollectionService = game:GetService("CollectionService")
+local Selection = game:GetService("Selection")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+
+local Constants = require(script.Parent.Constants)
+local Util = require(script.Parent.Util)
+
+local NodeService = {}
+
+local function normalizeNumberAttribute(attributeName, rawValue)
+	local config = Constants.NUMERIC_FIELDS[attributeName]
+	local defaultValue = Constants.DEFAULT_ATTRIBUTES[attributeName]
+	local value = tonumber(rawValue)
+	if value == nil then
+		value = defaultValue
+	end
+
+	if config then
+		value = Util.Clamp(value, config.Min, config.Max)
+		value = Util.ApplyStep(value, config.Step)
+		value = Util.Round(value, config.Precision or 0)
+	end
+
+	return value
+end
+
+local function collectBasePartsFromSelection(instances, includeTaggedOnly)
+	local results = {}
+	local seen = {}
+
+	local function tryAdd(instance)
+		if not instance:IsA("BasePart") then
+			return
+		end
+		if includeTaggedOnly and not CollectionService:HasTag(instance, Constants.NODE_TAG) then
+			return
+		end
+		if seen[instance] then
+			return
+		end
+		seen[instance] = true
+		table.insert(results, instance)
+	end
+
+	for _, selected in ipairs(instances) do
+		tryAdd(selected)
+		for _, desc in ipairs(selected:GetDescendants()) do
+			tryAdd(desc)
+		end
+	end
+
+	return results
+end
+
+local function setWaypointIfNeeded(options, fallbackName)
+	if options and options.SkipWaypoint then
+		return
+	end
+	local waypointName = fallbackName
+	if options and type(options.WaypointName) == "string" and options.WaypointName ~= "" then
+		waypointName = options.WaypointName
+	end
+	ChangeHistoryService:SetWaypoint(waypointName)
+end
+
+local function sanitizeAttributeValue(attributeName, value)
+	if attributeName == "Enabled" then
+		return value == true
+	end
+
+	if Constants.NUMERIC_FIELDS[attributeName] then
+		return normalizeNumberAttribute(attributeName, value)
+	end
+
+	if attributeName == "IslandName" then
+		return Util.Trim(tostring(value or ""))
+	end
+
+	if attributeName == "EnemyPool" then
+		local poolList = Util.SplitCsv(tostring(value or ""))
+		return Util.JoinCsv(poolList)
+	end
+
+	return value
+end
+
+local function ensureDefaultAttributes(node)
+	for attributeName, defaultValue in pairs(Constants.DEFAULT_ATTRIBUTES) do
+		if node:GetAttribute(attributeName) == nil then
+			node:SetAttribute(attributeName, defaultValue)
+		end
+	end
+end
+
+local function sanitizeNodeAttributes(node)
+	for _, attributeName in ipairs(Constants.NUMERIC_FIELD_ORDER) do
+		local current = node:GetAttribute(attributeName)
+		local sanitized = sanitizeAttributeValue(attributeName, current)
+		node:SetAttribute(attributeName, sanitized)
+	end
+
+	local enabledValue = node:GetAttribute("Enabled")
+	if type(enabledValue) ~= "boolean" then
+		node:SetAttribute("Enabled", Constants.DEFAULT_ATTRIBUTES.Enabled)
+	end
+
+	local islandName = node:GetAttribute("IslandName")
+	if type(islandName) ~= "string" then
+		node:SetAttribute("IslandName", Constants.DEFAULT_ATTRIBUTES.IslandName)
+	end
+
+	local csvPool = node:GetAttribute("EnemyPool")
+	if type(csvPool) ~= "string" then
+		node:SetAttribute("EnemyPool", Constants.DEFAULT_ATTRIBUTES.EnemyPool)
+	end
+end
+
+local function applyDependentConstraints(node)
+	local radius = sanitizeAttributeValue("Radius", node:GetAttribute("Radius"))
+	local activationDistance = sanitizeAttributeValue("ActivationDistance", node:GetAttribute("ActivationDistance"))
+	local respawnMin = sanitizeAttributeValue("RespawnMin", node:GetAttribute("RespawnMin"))
+	local respawnMax = sanitizeAttributeValue("RespawnMax", node:GetAttribute("RespawnMax"))
+
+	if activationDistance < (radius + 8) then
+		activationDistance = radius + 8
+	end
+	if respawnMax < respawnMin then
+		respawnMax = respawnMin
+	end
+
+	node:SetAttribute("Radius", radius)
+	node:SetAttribute("ActivationDistance", activationDistance)
+	node:SetAttribute("RespawnMin", respawnMin)
+	node:SetAttribute("RespawnMax", respawnMax)
+end
+
+local function getNodeEnemyPool(node)
+	local csvText = node:GetAttribute("EnemyPool")
+	local parsed = Util.SplitCsv(tostring(csvText or ""))
+	if #parsed <= 0 then
+		return Util.CloneArray(Constants.DEFAULT_ENEMY_POOL)
+	end
+	return parsed
+end
+
+local function buildNumericState(nodes, attributeName)
+	local firstValue = nil
+	local mixed = false
+
+	for _, node in ipairs(nodes) do
+		local currentValue = sanitizeAttributeValue(attributeName, node:GetAttribute(attributeName))
+		if firstValue == nil then
+			firstValue = currentValue
+		elseif currentValue ~= firstValue then
+			mixed = true
+			break
+		end
+	end
+
+	return {
+		mixed = mixed,
+		value = firstValue,
+	}
+end
+
+local function buildBooleanState(nodes, attributeName)
+	local firstValue = nil
+	local mixed = false
+
+	for _, node in ipairs(nodes) do
+		local current = node:GetAttribute(attributeName)
+		local value = current == true
+		if firstValue == nil then
+			firstValue = value
+		elseif firstValue ~= value then
+			mixed = true
+			break
+		end
+	end
+
+	return {
+		mixed = mixed,
+		value = firstValue == true,
+	}
+end
+
+local function buildEnemyStates(nodes, enemyTypes)
+	local states = {}
+	if #nodes <= 0 then
+		for _, enemyName in ipairs(enemyTypes) do
+			states[enemyName] = "none"
+		end
+		return states
+	end
+
+	for _, enemyName in ipairs(enemyTypes) do
+		local count = 0
+		for _, node in ipairs(nodes) do
+			local pool = getNodeEnemyPool(node)
+			if Util.ArrayContains(pool, enemyName) then
+				count += 1
+			end
+		end
+
+		if count == #nodes then
+			states[enemyName] = "all"
+		elseif count > 0 then
+			states[enemyName] = "some"
+		else
+			states[enemyName] = "none"
+		end
+	end
+
+	return states
+end
+
+function NodeService.GetSelectedNodes()
+	local selected = Selection:Get()
+	local nodes = collectBasePartsFromSelection(selected, true)
+	table.sort(nodes, function(left, right)
+		return left:GetFullName() < right:GetFullName()
+	end)
+	return nodes
+end
+
+function NodeService.ApplyAttribute(nodes, attributeName, value, options)
+	if #nodes <= 0 then
+		return 0
+	end
+
+	local sanitized = sanitizeAttributeValue(attributeName, value)
+	if sanitized == nil then
+		return 0
+	end
+
+	local changed = 0
+	for _, node in ipairs(nodes) do
+		local current = node:GetAttribute(attributeName)
+		if current ~= sanitized then
+			node:SetAttribute(attributeName, sanitized)
+			changed += 1
+		end
+		applyDependentConstraints(node)
+	end
+
+	if changed > 0 then
+		setWaypointIfNeeded(options, "Ambient Spawn: " .. tostring(attributeName))
+	end
+
+	return changed
+end
+
+function NodeService.StepAttribute(nodes, attributeName, deltaValue)
+	if #nodes <= 0 then
+		return 0
+	end
+
+	local config = Constants.NUMERIC_FIELDS[attributeName]
+	if not config then
+		return 0
+	end
+
+	local changed = 0
+	for _, node in ipairs(nodes) do
+		local current = sanitizeAttributeValue(attributeName, node:GetAttribute(attributeName))
+		local nextValue = current + deltaValue
+
+		if attributeName == "RespawnMax" then
+			local respawnMin = sanitizeAttributeValue("RespawnMin", node:GetAttribute("RespawnMin"))
+			nextValue = math.max(nextValue, respawnMin)
+		elseif attributeName == "RespawnMin" then
+			local respawnMax = sanitizeAttributeValue("RespawnMax", node:GetAttribute("RespawnMax"))
+			if nextValue > respawnMax then
+				node:SetAttribute("RespawnMax", nextValue)
+			end
+		end
+
+		nextValue = sanitizeAttributeValue(attributeName, nextValue)
+		if current ~= nextValue then
+			node:SetAttribute(attributeName, nextValue)
+			changed += 1
+		end
+		applyDependentConstraints(node)
+	end
+
+	if changed > 0 then
+		ChangeHistoryService:SetWaypoint("Ambient Spawn: " .. tostring(attributeName))
+	end
+
+	return changed
+end
+
+function NodeService.ToggleEnemy(nodes, enemyName, shouldEnable)
+	if #nodes <= 0 then
+		return 0
+	end
+
+	local changed = 0
+	for _, node in ipairs(nodes) do
+		local pool = getNodeEnemyPool(node)
+		local hasEnemy = Util.ArrayContains(pool, enemyName)
+		if shouldEnable and not hasEnemy then
+			table.insert(pool, enemyName)
+		elseif (not shouldEnable) and hasEnemy then
+			pool = Util.ArrayWithout(pool, enemyName)
+		end
+
+		local csvText = Util.JoinCsv(pool)
+		local current = node:GetAttribute("EnemyPool")
+		if current ~= csvText then
+			node:SetAttribute("EnemyPool", csvText)
+			changed += 1
+		end
+	end
+
+	if changed > 0 then
+		ChangeHistoryService:SetWaypoint("Ambient Spawn: EnemyPool")
+	end
+
+	return changed
+end
+
+function NodeService.ApplyPreset(nodes, presetName)
+	if #nodes <= 0 then
+		return 0
+	end
+
+	local preset = Constants.PRESETS[presetName]
+	if not preset then
+		return 0
+	end
+
+	local changed = 0
+	for attributeName, presetValue in pairs(preset) do
+		changed += NodeService.ApplyAttribute(nodes, attributeName, presetValue, { SkipWaypoint = true })
+	end
+
+	if changed > 0 then
+		ChangeHistoryService:SetWaypoint("Ambient Spawn: Preset " .. tostring(presetName))
+	end
+
+	return changed
+end
+
+function NodeService.CreateNode()
+	local parentFolder, err = Util.EnsureFolderPath(Constants.NODE_PARENT_PATH)
+	if not parentFolder then
+		return nil, err or "Unable to resolve node parent path"
+	end
+
+	local node = Instance.new("Part")
+	node.Name = Constants.NODE_NAME
+	node.Shape = Enum.PartType.Block
+	node.Size = Vector3.new(4, 1, 4)
+	node.Color = Color3.fromRGB(79, 143, 246)
+	node.Material = Enum.Material.SmoothPlastic
+	node.Anchored = true
+	node.CanCollide = false
+	node.CanTouch = false
+	node.Transparency = 0.15
+	node.TopSurface = Enum.SurfaceType.Smooth
+	node.BottomSurface = Enum.SurfaceType.Smooth
+
+	local newPosition = Vector3.new(0, 8, 0)
+	for _, selected in ipairs(Selection:Get()) do
+		if selected:IsA("BasePart") then
+			newPosition = selected.Position + Vector3.new(0, 4, 0)
+			break
+		end
+	end
+	if newPosition == Vector3.new(0, 8, 0) and workspace.CurrentCamera then
+		newPosition = workspace.CurrentCamera.CFrame.Position + (workspace.CurrentCamera.CFrame.LookVector * 24)
+	end
+
+	node.Position = newPosition
+	node.Parent = parentFolder
+
+	ensureDefaultAttributes(node)
+	sanitizeNodeAttributes(node)
+	applyDependentConstraints(node)
+
+	if node:GetAttribute("IslandName") == "" then
+		local inferredIsland = Util.InferIslandName(node)
+		if inferredIsland then
+			node:SetAttribute("IslandName", inferredIsland)
+		end
+	end
+
+	CollectionService:AddTag(node, Constants.NODE_TAG)
+	Selection:Set({ node })
+	ChangeHistoryService:SetWaypoint("Ambient Spawn: Create Node")
+
+	return node
+end
+
+function NodeService.TagSelection()
+	local selected = Selection:Get()
+	local parts = collectBasePartsFromSelection(selected, false)
+
+	local changed = 0
+	for _, part in ipairs(parts) do
+		if not CollectionService:HasTag(part, Constants.NODE_TAG) then
+			CollectionService:AddTag(part, Constants.NODE_TAG)
+			changed += 1
+		end
+		ensureDefaultAttributes(part)
+		sanitizeNodeAttributes(part)
+		applyDependentConstraints(part)
+	end
+
+	if changed > 0 then
+		ChangeHistoryService:SetWaypoint("Ambient Spawn: Tag Selection")
+	end
+
+	return changed
+end
+
+function NodeService.UntagSelection()
+	local selectedNodes = NodeService.GetSelectedNodes()
+	local changed = 0
+
+	for _, node in ipairs(selectedNodes) do
+		if CollectionService:HasTag(node, Constants.NODE_TAG) then
+			CollectionService:RemoveTag(node, Constants.NODE_TAG)
+			changed += 1
+		end
+	end
+
+	if changed > 0 then
+		ChangeHistoryService:SetWaypoint("Ambient Spawn: Untag Selection")
+	end
+
+	return changed
+end
+
+function NodeService.BuildPreviewRecords(nodes)
+	local records = {}
+	for _, node in ipairs(nodes) do
+		local radius = sanitizeAttributeValue("Radius", node:GetAttribute("Radius"))
+		local maxAlive = sanitizeAttributeValue("MaxAlive", node:GetAttribute("MaxAlive"))
+		local enemyPool = getNodeEnemyPool(node)
+		table.insert(records, {
+			Node = node,
+			Position = node.Position,
+			Radius = radius,
+			MaxAlive = maxAlive,
+			EnemyPool = enemyPool,
+		})
+	end
+	return records
+end
+
+function NodeService.BuildSelectionModel(nodes, enemyTypes)
+	local hasSelection = #nodes > 0
+	local model = {
+		count = #nodes,
+		hasSelection = hasSelection,
+		values = {},
+		enemyStates = buildEnemyStates(nodes, enemyTypes or {}),
+	}
+
+	if hasSelection then
+		model.values.Enabled = buildBooleanState(nodes, "Enabled")
+		for _, attributeName in ipairs(Constants.NUMERIC_FIELD_ORDER) do
+			model.values[attributeName] = buildNumericState(nodes, attributeName)
+		end
+	else
+		model.values.Enabled = { mixed = false, value = Constants.DEFAULT_ATTRIBUTES.Enabled }
+		for _, attributeName in ipairs(Constants.NUMERIC_FIELD_ORDER) do
+			model.values[attributeName] = {
+				mixed = false,
+				value = Constants.DEFAULT_ATTRIBUTES[attributeName],
+			}
+		end
+	end
+
+	return model
+end
+
+return NodeService
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="5">
+        <Properties>
+          <string name="Name">PreviewService</string>
+          <string name="Source"><![CDATA[local Constants = require(script.Parent.Constants)
+
+local PreviewService = {
+	ShowRadius = true,
+	ShowMarkers = true,
+	PreviewFolder = nil,
+}
+
+local GOLDEN_ANGLE = 2.399963229728653
+
+local function ensurePreviewFolder()
+	if PreviewService.PreviewFolder and PreviewService.PreviewFolder.Parent then
+		return PreviewService.PreviewFolder
+	end
+
+	local existing = workspace:FindFirstChild(Constants.PREVIEW_FOLDER_NAME)
+	if existing then
+		existing:Destroy()
+	end
+
+	local folder = Instance.new("Folder")
+	folder.Name = Constants.PREVIEW_FOLDER_NAME
+	folder.Archivable = false
+	folder.Parent = workspace
+	PreviewService.PreviewFolder = folder
+	return folder
+end
+
+local function clearPreviewObjects()
+	local folder = PreviewService.PreviewFolder
+	if not folder then
+		return
+	end
+	for _, child in ipairs(folder:GetChildren()) do
+		child:Destroy()
+	end
+end
+
+local function getEnemyColor(enemyName)
+	local hash = 0
+	for index = 1, #enemyName do
+		hash += string.byte(enemyName, index) * index
+	end
+	local hue = (hash % 360) / 360
+	return Color3.fromHSV(hue, 0.55, 0.98)
+end
+
+local function getGroundedPosition(rawPosition, ignoreList)
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	rayParams.FilterDescendantsInstances = ignoreList
+	rayParams.IgnoreWater = true
+
+	local rayOrigin = rawPosition + Vector3.new(0, 64, 0)
+	local result = workspace:Raycast(rayOrigin, Vector3.new(0, -320, 0), rayParams)
+	if result then
+		return result.Position + Vector3.new(0, 3.5, 0)
+	end
+	return rawPosition + Vector3.new(0, 3.5, 0)
+end
+
+local function createRadiusAdornment(folder, worldPosition, radius)
+	local sphere = Instance.new("SphereHandleAdornment")
+	sphere.Name = "RadiusPreview"
+	sphere.Adornee = workspace.Terrain
+	sphere.AlwaysOnTop = false
+	sphere.ZIndex = 1
+	sphere.Color3 = Color3.fromRGB(82, 165, 255)
+	sphere.Transparency = 0.83
+	sphere.Radius = radius
+	sphere.CFrame = CFrame.new(worldPosition)
+	sphere.Parent = folder
+
+	local centerDot = Instance.new("SphereHandleAdornment")
+	centerDot.Name = "CenterPreview"
+	centerDot.Adornee = workspace.Terrain
+	centerDot.AlwaysOnTop = true
+	centerDot.ZIndex = 2
+	centerDot.Color3 = Color3.fromRGB(253, 220, 122)
+	centerDot.Transparency = 0.1
+	centerDot.Radius = 1.25
+	centerDot.CFrame = CFrame.new(worldPosition)
+	centerDot.Parent = folder
+end
+
+local function createEnemyMarker(folder, worldPosition, enemyName)
+	local markerPart = Instance.new("Part")
+	markerPart.Name = "EnemyMarkerAnchor"
+	markerPart.Size = Vector3.new(0.2, 0.2, 0.2)
+	markerPart.Transparency = 1
+	markerPart.Anchored = true
+	markerPart.Locked = true
+	markerPart.CanCollide = false
+	markerPart.CanTouch = false
+	markerPart.CanQuery = false
+	markerPart.Archivable = false
+	markerPart.Position = worldPosition
+	markerPart.Parent = folder
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "EnemyMarkerBillboard"
+	billboard.Adornee = markerPart
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.Size = UDim2.fromOffset(92, 24)
+	billboard.StudsOffset = Vector3.new(0, 2, 0)
+	billboard.Parent = markerPart
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Text"
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundColor3 = getEnemyColor(enemyName)
+	label.BackgroundTransparency = 0.2
+	label.BorderSizePixel = 0
+	label.Font = Enum.Font.GothamSemibold
+	label.TextSize = 11
+	label.TextColor3 = Color3.fromRGB(26, 26, 26)
+	label.Text = enemyName
+	label.Parent = billboard
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 5)
+	corner.Parent = label
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(255, 255, 255)
+	stroke.Thickness = 1
+	stroke.Transparency = 0.5
+	stroke.Parent = label
+end
+
+function PreviewService.SetOptions(showRadius, showMarkers)
+	PreviewService.ShowRadius = showRadius == true
+	PreviewService.ShowMarkers = showMarkers == true
+end
+
+function PreviewService.Render(records)
+	local folder = ensurePreviewFolder()
+	clearPreviewObjects()
+
+	if not records or #records <= 0 then
+		return
+	end
+
+	for _, record in ipairs(records) do
+		if record.Node == nil or record.Node.Parent == nil then
+			continue
+		end
+
+		local center = record.Position
+		local radius = math.max(1, tonumber(record.Radius) or 1)
+		local maxAlive = math.max(0, math.floor(tonumber(record.MaxAlive) or 0))
+		local enemyPool = record.EnemyPool or {}
+		if #enemyPool <= 0 then
+			enemyPool = Constants.DEFAULT_ENEMY_POOL
+		end
+
+		if PreviewService.ShowRadius then
+			createRadiusAdornment(folder, center, radius)
+		end
+
+		if PreviewService.ShowMarkers and maxAlive > 0 then
+			local ignoreList = { folder }
+			for index = 1, maxAlive do
+				local distance = radius * math.sqrt((index - 0.5) / maxAlive) * 0.9
+				local angle = GOLDEN_ANGLE * index
+				local planarOffset = Vector3.new(math.cos(angle) * distance, 0, math.sin(angle) * distance)
+				local basePosition = center + planarOffset
+				local markerPosition = getGroundedPosition(basePosition, ignoreList)
+
+				local enemyName = enemyPool[((index - 1) % #enemyPool) + 1]
+				createEnemyMarker(folder, markerPosition, enemyName)
+			end
+		end
+	end
+end
+
+function PreviewService.Destroy()
+	if PreviewService.PreviewFolder and PreviewService.PreviewFolder.Parent then
+		PreviewService.PreviewFolder:Destroy()
+	end
+	PreviewService.PreviewFolder = nil
+end
+
+return PreviewService
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="6">
+        <Properties>
+          <string name="Name">State</string>
+          <string name="Source"><![CDATA[local State = {
+	SelectedNodes = {},
+	EnemyTypes = {},
+	ShowRadiusPreview = true,
+	ShowMarkerPreview = true,
+}
+
+function State.SetSelectedNodes(nodes)
+	State.SelectedNodes = nodes or {}
+end
+
+function State.GetSelectedNodes()
+	return State.SelectedNodes
+end
+
+function State.SetEnemyTypes(enemyTypes)
+	State.EnemyTypes = enemyTypes or {}
+end
+
+function State.GetEnemyTypes()
+	return State.EnemyTypes
+end
+
+function State.SetShowRadiusPreview(enabledValue)
+	State.ShowRadiusPreview = enabledValue == true
+end
+
+function State.GetShowRadiusPreview()
+	return State.ShowRadiusPreview
+end
+
+function State.SetShowMarkerPreview(enabledValue)
+	State.ShowMarkerPreview = enabledValue == true
+end
+
+function State.GetShowMarkerPreview()
+	return State.ShowMarkerPreview
+end
+
+return State
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="7">
+        <Properties>
+          <string name="Name">Theme</string>
+          <string name="Source"><![CDATA[local Theme = {}
+
+Theme.Font = Enum.Font.Gotham
+Theme.FontBold = Enum.Font.GothamBold
+Theme.FontSemibold = Enum.Font.GothamSemibold
+
+Theme.Background = Color3.fromRGB(18, 20, 24)
+Theme.Surface = Color3.fromRGB(26, 29, 35)
+Theme.Surface2 = Color3.fromRGB(33, 37, 44)
+Theme.Border = Color3.fromRGB(56, 62, 72)
+
+Theme.Text = Color3.fromRGB(236, 240, 245)
+Theme.TextMuted = Color3.fromRGB(176, 184, 198)
+Theme.TextDim = Color3.fromRGB(132, 141, 156)
+
+Theme.Green = Color3.fromRGB(74, 214, 138)
+Theme.Yellow = Color3.fromRGB(248, 198, 88)
+Theme.Red = Color3.fromRGB(241, 111, 111)
+Theme.Blue = Color3.fromRGB(93, 170, 255)
+Theme.Gray = Color3.fromRGB(98, 107, 121)
+
+Theme.Corner = UDim.new(0, 6)
+
+return Theme
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="8">
+        <Properties>
+          <string name="Name">UI</string>
+          <string name="Source"><![CDATA[local Constants = require(script.Parent.Constants)
+local Theme = require(script.Parent.Theme)
+local Util = require(script.Parent.Util)
+
+local UI = {}
+
+local function applyCorner(instance, cornerRadius)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = cornerRadius or Theme.Corner
+	corner.Parent = instance
+	return corner
+end
+
+local function applyStroke(instance, color, transparency)
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = color or Theme.Border
+	stroke.Transparency = transparency or 0
+	stroke.Thickness = 1
+	stroke.Parent = instance
+	return stroke
+end
+
+local function createTextButton(parent, text, width)
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(0, width or 100, 0, 26)
+	button.BackgroundColor3 = Theme.Surface2
+	button.TextColor3 = Theme.Text
+	button.TextSize = 11
+	button.Font = Theme.FontSemibold
+	button.AutoButtonColor = true
+	button.Text = text
+	button.Parent = parent
+	applyCorner(button)
+	applyStroke(button)
+	return button
+end
+
+local function createLabel(parent, text, size)
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Center
+	label.TextColor3 = Theme.Text
+	label.TextSize = 12
+	label.Font = Theme.Font
+	label.Text = text
+	label.Size = size or UDim2.new(1, 0, 0, 18)
+	label.Parent = parent
+	return label
+end
+
+function UI.new(plugin, enemyTypes, callbacks)
+	local self = {
+		Widget = nil,
+		Root = nil,
+		StatusLabel = nil,
+		SelectionLabel = nil,
+		EnabledButton = nil,
+		RadiusPreviewButton = nil,
+		MarkerPreviewButton = nil,
+		EnemySearchBox = nil,
+		EnemyListFrame = nil,
+		EnemyRows = {},
+		NumberRows = {},
+		Connections = {},
+		HasSelection = false,
+		SuppressNumericSignal = false,
+		LatestModel = nil,
+		ToastToken = 0,
+	}
+
+	local widgetInfo = DockWidgetPluginGuiInfo.new(
+		Enum.InitialDockState.Right,
+		false,
+		true,
+		410,
+		680,
+		320,
+		460
+	)
+
+	local widget = plugin:CreateDockWidgetPluginGui(Constants.WIDGET_ID, widgetInfo)
+	widget.Title = Constants.WIDGET_TITLE
+	widget.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	widget.Enabled = false
+	self.Widget = widget
+
+	local root = Instance.new("Frame")
+	root.Name = "Root"
+	root.Size = UDim2.fromScale(1, 1)
+	root.BackgroundColor3 = Theme.Background
+	root.BorderSizePixel = 0
+	root.Parent = widget
+	self.Root = root
+
+	local rootPadding = Instance.new("UIPadding")
+	rootPadding.PaddingTop = UDim.new(0, 10)
+	rootPadding.PaddingBottom = UDim.new(0, 10)
+	rootPadding.PaddingLeft = UDim.new(0, 10)
+	rootPadding.PaddingRight = UDim.new(0, 10)
+	rootPadding.Parent = root
+
+	local content = Instance.new("ScrollingFrame")
+	content.Name = "Content"
+	content.Size = UDim2.fromScale(1, 1)
+	content.BackgroundTransparency = 1
+	content.BorderSizePixel = 0
+	content.ScrollBarThickness = 4
+	content.CanvasSize = UDim2.new(0, 0, 0, 0)
+	content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	content.Parent = root
+
+	local contentLayout = Instance.new("UIListLayout")
+	contentLayout.Padding = UDim.new(0, 8)
+	contentLayout.FillDirection = Enum.FillDirection.Vertical
+	contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	contentLayout.Parent = content
+
+	local status = createLabel(content, "Ready", UDim2.new(1, 0, 0, 20))
+	status.TextColor3 = Theme.TextMuted
+	status.TextSize = 11
+	status.LayoutOrder = 1
+	self.StatusLabel = status
+
+	local actionRow = Instance.new("Frame")
+	actionRow.Name = "ActionRow"
+	actionRow.Size = UDim2.new(1, 0, 0, 28)
+	actionRow.BackgroundTransparency = 1
+	actionRow.LayoutOrder = 2
+	actionRow.Parent = content
+
+	local actionLayout = Instance.new("UIListLayout")
+	actionLayout.FillDirection = Enum.FillDirection.Horizontal
+	actionLayout.Padding = UDim.new(0, 6)
+	actionLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+	actionLayout.Parent = actionRow
+
+	local createButton = createTextButton(actionRow, "Create Node", 112)
+	local tagButton = createTextButton(actionRow, "Tag Selected", 100)
+	local untagButton = createTextButton(actionRow, "Untag Selected", 110)
+
+	table.insert(self.Connections, createButton.Activated:Connect(function()
+		if callbacks.CreateNode then
+			callbacks.CreateNode()
+		end
+	end))
+	table.insert(self.Connections, tagButton.Activated:Connect(function()
+		if callbacks.TagSelection then
+			callbacks.TagSelection()
+		end
+	end))
+	table.insert(self.Connections, untagButton.Activated:Connect(function()
+		if callbacks.UntagSelection then
+			callbacks.UntagSelection()
+		end
+	end))
+
+	local selectionLabel = createLabel(content, "No ambient spawn nodes selected", UDim2.new(1, 0, 0, 20))
+	selectionLabel.TextColor3 = Theme.TextDim
+	selectionLabel.TextSize = 11
+	selectionLabel.LayoutOrder = 3
+	self.SelectionLabel = selectionLabel
+
+	local previewRow = Instance.new("Frame")
+	previewRow.Name = "PreviewRow"
+	previewRow.Size = UDim2.new(1, 0, 0, 28)
+	previewRow.BackgroundTransparency = 1
+	previewRow.LayoutOrder = 4
+	previewRow.Parent = content
+
+	local previewLayout = Instance.new("UIListLayout")
+	previewLayout.FillDirection = Enum.FillDirection.Horizontal
+	previewLayout.Padding = UDim.new(0, 6)
+	previewLayout.Parent = previewRow
+
+	local radiusToggle = createTextButton(previewRow, "Radius: On", 96)
+	local markerToggle = createTextButton(previewRow, "Max Preview: On", 118)
+	local reloadEnemiesButton = createTextButton(previewRow, "Reload Enemy Types", 150)
+
+	self.RadiusPreviewButton = radiusToggle
+	self.MarkerPreviewButton = markerToggle
+
+	local function setPreviewButtonState(button, enabledValue, prefix)
+		if enabledValue then
+			button.Text = prefix .. ": On"
+			button.BackgroundColor3 = Theme.Blue
+			button.TextColor3 = Color3.fromRGB(18, 20, 24)
+		else
+			button.Text = prefix .. ": Off"
+			button.BackgroundColor3 = Theme.Surface2
+			button.TextColor3 = Theme.Text
+		end
+	end
+
+	table.insert(self.Connections, radiusToggle.Activated:Connect(function()
+		local turningOn = radiusToggle.Text:find(": Off", 1, true) ~= nil
+		setPreviewButtonState(radiusToggle, turningOn, "Radius")
+		if callbacks.SetRadiusPreview then
+			callbacks.SetRadiusPreview(turningOn)
+		end
+	end))
+
+	table.insert(self.Connections, markerToggle.Activated:Connect(function()
+		local turningOn = markerToggle.Text:find(": Off", 1, true) ~= nil
+		setPreviewButtonState(markerToggle, turningOn, "Max Preview")
+		if callbacks.SetMarkerPreview then
+			callbacks.SetMarkerPreview(turningOn)
+		end
+	end))
+
+	table.insert(self.Connections, reloadEnemiesButton.Activated:Connect(function()
+		if callbacks.ReloadEnemyTypes then
+			callbacks.ReloadEnemyTypes()
+		end
+	end))
+
+	local enabledRow = Instance.new("Frame")
+	enabledRow.Name = "EnabledRow"
+	enabledRow.Size = UDim2.new(1, 0, 0, 28)
+	enabledRow.BackgroundTransparency = 1
+	enabledRow.LayoutOrder = 5
+	enabledRow.Parent = content
+
+	local enabledLabel = createLabel(enabledRow, "Enabled", UDim2.new(0, 130, 1, 0))
+	enabledLabel.Position = UDim2.new(0, 0, 0, 0)
+	enabledLabel.TextSize = 11
+
+	local enabledButton = createTextButton(enabledRow, "Enabled: On", 140)
+	enabledButton.Position = UDim2.new(1, -140, 0, 0)
+	enabledButton.AnchorPoint = Vector2.new(0, 0)
+	self.EnabledButton = enabledButton
+
+	local function setEnabledVisual(valueState)
+		if valueState.mixed then
+			enabledButton.Text = "Enabled: Mixed"
+			enabledButton.BackgroundColor3 = Theme.Yellow
+			enabledButton.TextColor3 = Color3.fromRGB(25, 22, 18)
+			return
+		end
+		if valueState.value then
+			enabledButton.Text = "Enabled: On"
+			enabledButton.BackgroundColor3 = Theme.Green
+			enabledButton.TextColor3 = Color3.fromRGB(18, 24, 19)
+		else
+			enabledButton.Text = "Enabled: Off"
+			enabledButton.BackgroundColor3 = Theme.Red
+			enabledButton.TextColor3 = Color3.fromRGB(34, 20, 20)
+		end
+	end
+
+	table.insert(self.Connections, enabledButton.Activated:Connect(function()
+		if not self.HasSelection then
+			return
+		end
+		if callbacks.SetEnabled then
+			local model = self.LatestModel
+			local currentState = model and model.values and model.values.Enabled or { mixed = false, value = true }
+			local nextValue = true
+			if currentState.mixed then
+				nextValue = true
+			else
+				nextValue = not currentState.value
+			end
+			callbacks.SetEnabled(nextValue)
+		end
+	end))
+
+	local numbersCard = Instance.new("Frame")
+	numbersCard.Name = "NumbersCard"
+	numbersCard.Size = UDim2.new(1, 0, 0, 0)
+	numbersCard.AutomaticSize = Enum.AutomaticSize.Y
+	numbersCard.BackgroundColor3 = Theme.Surface
+	numbersCard.BorderSizePixel = 0
+	numbersCard.LayoutOrder = 6
+	numbersCard.Parent = content
+	applyCorner(numbersCard)
+	applyStroke(numbersCard)
+
+	local numbersPadding = Instance.new("UIPadding")
+	numbersPadding.PaddingTop = UDim.new(0, 8)
+	numbersPadding.PaddingBottom = UDim.new(0, 8)
+	numbersPadding.PaddingLeft = UDim.new(0, 8)
+	numbersPadding.PaddingRight = UDim.new(0, 8)
+	numbersPadding.Parent = numbersCard
+
+	local numbersLayout = Instance.new("UIListLayout")
+	numbersLayout.FillDirection = Enum.FillDirection.Vertical
+	numbersLayout.Padding = UDim.new(0, 6)
+	numbersLayout.Parent = numbersCard
+
+	local numbersTitle = createLabel(numbersCard, "Spawn Tuning", UDim2.new(1, 0, 0, 18))
+	numbersTitle.Font = Theme.FontBold
+	numbersTitle.TextSize = 12
+
+	local function createNumberRow(attributeName)
+		local config = Constants.NUMERIC_FIELDS[attributeName]
+
+		local row = Instance.new("Frame")
+		row.Name = attributeName .. "Row"
+		row.Size = UDim2.new(1, 0, 0, 26)
+		row.BackgroundTransparency = 1
+		row.Parent = numbersCard
+
+		local label = createLabel(row, attributeName, UDim2.new(0, 170, 1, 0))
+		label.TextSize = 11
+
+		local minusButton = createTextButton(row, "-", 24)
+		minusButton.Position = UDim2.new(0, 178, 0, 0)
+		minusButton.TextSize = 15
+
+		local valueBox = Instance.new("TextBox")
+		valueBox.Name = attributeName .. "Box"
+		valueBox.Size = UDim2.new(0, 90, 1, 0)
+		valueBox.Position = UDim2.new(0, 208, 0, 0)
+		valueBox.BackgroundColor3 = Theme.Background
+		valueBox.BorderSizePixel = 0
+		valueBox.TextColor3 = Theme.Text
+		valueBox.TextSize = 11
+		valueBox.Font = Theme.FontSemibold
+		valueBox.PlaceholderText = "Value"
+		valueBox.PlaceholderColor3 = Theme.TextDim
+		valueBox.Text = Util.FormatNumber(Constants.DEFAULT_ATTRIBUTES[attributeName], config.Precision)
+		valueBox.ClearTextOnFocus = false
+		valueBox.Parent = row
+		applyCorner(valueBox)
+		applyStroke(valueBox)
+
+		local plusButton = createTextButton(row, "+", 24)
+		plusButton.Position = UDim2.new(0, 304, 0, 0)
+		plusButton.TextSize = 14
+
+		table.insert(self.Connections, minusButton.Activated:Connect(function()
+			if not self.HasSelection then
+				return
+			end
+			if callbacks.StepNumber then
+				callbacks.StepNumber(attributeName, -config.Step)
+			end
+		end))
+
+		table.insert(self.Connections, plusButton.Activated:Connect(function()
+			if not self.HasSelection then
+				return
+			end
+			if callbacks.StepNumber then
+				callbacks.StepNumber(attributeName, config.Step)
+			end
+		end))
+
+		table.insert(self.Connections, valueBox:GetPropertyChangedSignal("Text"):Connect(function()
+			if self.SuppressNumericSignal or not self.HasSelection then
+				return
+			end
+			local parsed = tonumber(valueBox.Text)
+			if parsed and callbacks.SetNumber then
+				callbacks.SetNumber(attributeName, parsed, true)
+			end
+		end))
+
+		table.insert(self.Connections, valueBox.FocusLost:Connect(function()
+			if self.SuppressNumericSignal or not self.HasSelection then
+				return
+			end
+			local parsed = tonumber(valueBox.Text)
+			if parsed and callbacks.SetNumber then
+				callbacks.SetNumber(attributeName, parsed, false)
+			elseif callbacks.RequestRefresh then
+				callbacks.RequestRefresh()
+			end
+		end))
+
+		self.NumberRows[attributeName] = {
+			Row = row,
+			Label = label,
+			MinusButton = minusButton,
+			ValueBox = valueBox,
+			PlusButton = plusButton,
+		}
+	end
+
+	for _, attributeName in ipairs(Constants.NUMERIC_FIELD_ORDER) do
+		createNumberRow(attributeName)
+	end
+
+	local presetRow = Instance.new("Frame")
+	presetRow.Name = "PresetRow"
+	presetRow.Size = UDim2.new(1, 0, 0, 28)
+	presetRow.BackgroundTransparency = 1
+	presetRow.LayoutOrder = 7
+	presetRow.Parent = content
+
+	local presetLayout = Instance.new("UIListLayout")
+	presetLayout.FillDirection = Enum.FillDirection.Horizontal
+	presetLayout.Padding = UDim.new(0, 6)
+	presetLayout.Parent = presetRow
+
+	createLabel(presetRow, "Presets:", UDim2.new(0, 62, 1, 0)).TextSize = 11
+	local scoutPreset = createTextButton(presetRow, "Scout", 72)
+	local standardPreset = createTextButton(presetRow, "Standard", 80)
+	local heavyPreset = createTextButton(presetRow, "Heavy", 72)
+
+	table.insert(self.Connections, scoutPreset.Activated:Connect(function()
+		if self.HasSelection and callbacks.ApplyPreset then
+			callbacks.ApplyPreset("Scout")
+		end
+	end))
+	table.insert(self.Connections, standardPreset.Activated:Connect(function()
+		if self.HasSelection and callbacks.ApplyPreset then
+			callbacks.ApplyPreset("Standard")
+		end
+	end))
+	table.insert(self.Connections, heavyPreset.Activated:Connect(function()
+		if self.HasSelection and callbacks.ApplyPreset then
+			callbacks.ApplyPreset("Heavy")
+		end
+	end))
+
+	local enemyCard = Instance.new("Frame")
+	enemyCard.Name = "EnemyCard"
+	enemyCard.Size = UDim2.new(1, 0, 0, 0)
+	enemyCard.AutomaticSize = Enum.AutomaticSize.Y
+	enemyCard.BackgroundColor3 = Theme.Surface
+	enemyCard.BorderSizePixel = 0
+	enemyCard.LayoutOrder = 8
+	enemyCard.Parent = content
+	applyCorner(enemyCard)
+	applyStroke(enemyCard)
+
+	local enemyPadding = Instance.new("UIPadding")
+	enemyPadding.PaddingTop = UDim.new(0, 8)
+	enemyPadding.PaddingBottom = UDim.new(0, 8)
+	enemyPadding.PaddingLeft = UDim.new(0, 8)
+	enemyPadding.PaddingRight = UDim.new(0, 8)
+	enemyPadding.Parent = enemyCard
+
+	local enemyLayout = Instance.new("UIListLayout")
+	enemyLayout.FillDirection = Enum.FillDirection.Vertical
+	enemyLayout.Padding = UDim.new(0, 6)
+	enemyLayout.Parent = enemyCard
+
+	local enemyTitle = createLabel(enemyCard, "Enemy Types", UDim2.new(1, 0, 0, 18))
+	enemyTitle.Font = Theme.FontBold
+	enemyTitle.TextSize = 12
+
+	local searchBox = Instance.new("TextBox")
+	searchBox.Name = "EnemySearch"
+	searchBox.Size = UDim2.new(1, 0, 0, 24)
+	searchBox.BackgroundColor3 = Theme.Background
+	searchBox.BorderSizePixel = 0
+	searchBox.ClearTextOnFocus = false
+	searchBox.PlaceholderText = "Search enemy types..."
+	searchBox.PlaceholderColor3 = Theme.TextDim
+	searchBox.TextColor3 = Theme.Text
+	searchBox.TextSize = 11
+	searchBox.Font = Theme.Font
+	searchBox.Text = ""
+	searchBox.Parent = enemyCard
+	applyCorner(searchBox)
+	applyStroke(searchBox)
+	self.EnemySearchBox = searchBox
+
+	local enemyListFrame = Instance.new("ScrollingFrame")
+	enemyListFrame.Name = "EnemyList"
+	enemyListFrame.Size = UDim2.new(1, 0, 0, 190)
+	enemyListFrame.BackgroundColor3 = Theme.Background
+	enemyListFrame.BorderSizePixel = 0
+	enemyListFrame.ScrollBarThickness = 3
+	enemyListFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+	enemyListFrame.Parent = enemyCard
+	applyCorner(enemyListFrame)
+	applyStroke(enemyListFrame, Theme.Border, 0.4)
+	self.EnemyListFrame = enemyListFrame
+
+	local enemyListPadding = Instance.new("UIPadding")
+	enemyListPadding.PaddingTop = UDim.new(0, 6)
+	enemyListPadding.PaddingBottom = UDim.new(0, 6)
+	enemyListPadding.PaddingLeft = UDim.new(0, 6)
+	enemyListPadding.PaddingRight = UDim.new(0, 6)
+	enemyListPadding.Parent = enemyListFrame
+
+	local enemyListLayout = Instance.new("UIListLayout")
+	enemyListLayout.FillDirection = Enum.FillDirection.Vertical
+	enemyListLayout.Padding = UDim.new(0, 4)
+	enemyListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	enemyListLayout.Parent = enemyListFrame
+
+	table.insert(self.Connections, enemyListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		enemyListFrame.CanvasSize = UDim2.new(0, 0, 0, enemyListLayout.AbsoluteContentSize.Y + 12)
+	end))
+
+	function self:_applyEnemySearch()
+		local query = string.lower(self.EnemySearchBox.Text or "")
+		for enemyName, row in pairs(self.EnemyRows) do
+			local visible = true
+			if query ~= "" then
+				visible = string.find(string.lower(enemyName), query, 1, true) ~= nil
+			end
+			row.Frame.Visible = visible
+		end
+	end
+
+	table.insert(self.Connections, searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+		self:_applyEnemySearch()
+	end))
+
+	function self:_setEnemyRowState(enemyName, stateValue)
+		local row = self.EnemyRows[enemyName]
+		if not row then
+			return
+		end
+		row.State = stateValue
+
+		if stateValue == "all" then
+			row.StateDot.BackgroundColor3 = Theme.Green
+			row.StateText.Text = "✓"
+			row.StateText.TextColor3 = Color3.fromRGB(16, 33, 21)
+			row.StateText.BackgroundColor3 = Theme.Green
+		elseif stateValue == "some" then
+			row.StateDot.BackgroundColor3 = Theme.Yellow
+			row.StateText.Text = "~"
+			row.StateText.TextColor3 = Color3.fromRGB(39, 30, 15)
+			row.StateText.BackgroundColor3 = Theme.Yellow
+		else
+			row.StateDot.BackgroundColor3 = Theme.Gray
+			row.StateText.Text = ""
+			row.StateText.BackgroundColor3 = Theme.Surface2
+		end
+	end
+
+	function self:_createEnemyRow(enemyName, order)
+		local rowFrame = Instance.new("Frame")
+		rowFrame.Name = enemyName .. "Row"
+		rowFrame.Size = UDim2.new(1, 0, 0, 24)
+		rowFrame.BackgroundTransparency = 1
+		rowFrame.LayoutOrder = order
+		rowFrame.Parent = enemyListFrame
+
+		local clickButton = Instance.new("TextButton")
+		clickButton.Name = "ClickButton"
+		clickButton.Size = UDim2.fromScale(1, 1)
+		clickButton.BackgroundColor3 = Theme.Surface2
+		clickButton.BorderSizePixel = 0
+		clickButton.TextColor3 = Theme.Text
+		clickButton.TextXAlignment = Enum.TextXAlignment.Left
+		clickButton.TextSize = 11
+		clickButton.Font = Theme.FontSemibold
+		clickButton.Text = "      " .. enemyName
+		clickButton.Parent = rowFrame
+		applyCorner(clickButton)
+		applyStroke(clickButton, Theme.Border, 0.2)
+
+		local stateDot = Instance.new("Frame")
+		stateDot.Size = UDim2.new(0, 10, 0, 10)
+		stateDot.Position = UDim2.new(0, 8, 0.5, -5)
+		stateDot.BackgroundColor3 = Theme.Gray
+		stateDot.BorderSizePixel = 0
+		stateDot.Parent = clickButton
+		applyCorner(stateDot, UDim.new(1, 0))
+
+		local stateText = Instance.new("TextLabel")
+		stateText.Size = UDim2.new(0, 24, 0, 16)
+		stateText.Position = UDim2.new(1, -28, 0.5, -8)
+		stateText.BackgroundColor3 = Theme.Surface2
+		stateText.BackgroundTransparency = 0.15
+		stateText.Text = ""
+		stateText.TextColor3 = Theme.Text
+		stateText.TextSize = 11
+		stateText.Font = Theme.FontBold
+		stateText.Parent = clickButton
+		applyCorner(stateText, UDim.new(0, 4))
+
+		self.EnemyRows[enemyName] = {
+			Frame = rowFrame,
+			Button = clickButton,
+			StateDot = stateDot,
+			StateText = stateText,
+			State = "none",
+		}
+
+		table.insert(self.Connections, clickButton.Activated:Connect(function()
+			if not self.HasSelection or not callbacks.ToggleEnemy then
+				return
+			end
+			local currentState = self.EnemyRows[enemyName].State
+			local shouldEnable = currentState ~= "all"
+			callbacks.ToggleEnemy(enemyName, shouldEnable)
+		end))
+	end
+
+	function self:SetEnemyTypes(enemyTypeList)
+		for _, row in pairs(self.EnemyRows) do
+			if row.Frame then
+				row.Frame:Destroy()
+			end
+		end
+		self.EnemyRows = {}
+
+		local sorted = Util.CloneArray(enemyTypeList)
+		table.sort(sorted)
+		for index, enemyName in ipairs(sorted) do
+			self:_createEnemyRow(enemyName, index)
+		end
+		self:_applyEnemySearch()
+	end
+
+	function self:SetPreviewState(showRadius, showMarkers)
+		setPreviewButtonState(self.RadiusPreviewButton, showRadius == true, "Radius")
+		setPreviewButtonState(self.MarkerPreviewButton, showMarkers == true, "Max Preview")
+	end
+
+	function self:ShowToast(message, color)
+		self.ToastToken += 1
+		local token = self.ToastToken
+		self.StatusLabel.Text = tostring(message)
+		self.StatusLabel.TextColor3 = color or Theme.TextMuted
+		task.delay(2.3, function()
+			if self.ToastToken ~= token then
+				return
+			end
+			self.StatusLabel.Text = "Ready"
+			self.StatusLabel.TextColor3 = Theme.TextMuted
+		end)
+	end
+
+	function self:UpdateFromSelection(model)
+		self.LatestModel = model
+		self.HasSelection = model and model.hasSelection == true
+		local count = if model then model.count else 0
+		if self.HasSelection then
+			local labelSuffix = if count == 1 then "node" else "nodes"
+			self.SelectionLabel.Text = string.format("Selected %d %s", count, labelSuffix)
+			self.SelectionLabel.TextColor3 = Theme.Text
+		else
+			self.SelectionLabel.Text = "No ambient spawn nodes selected"
+			self.SelectionLabel.TextColor3 = Theme.TextDim
+		end
+
+		local enabledState = if model and model.values then model.values.Enabled else { mixed = false, value = Constants.DEFAULT_ATTRIBUTES.Enabled }
+		setEnabledVisual(enabledState)
+
+		self.SuppressNumericSignal = true
+		for _, attributeName in ipairs(Constants.NUMERIC_FIELD_ORDER) do
+			local row = self.NumberRows[attributeName]
+			local valueState = if model and model.values then model.values[attributeName] else nil
+			local config = Constants.NUMERIC_FIELDS[attributeName]
+
+			if valueState and valueState.mixed then
+				row.ValueBox.Text = "Mixed"
+				row.ValueBox.TextColor3 = Theme.Yellow
+			elseif valueState then
+				row.ValueBox.Text = Util.FormatNumber(valueState.value, config.Precision)
+				row.ValueBox.TextColor3 = Theme.Text
+			else
+				row.ValueBox.Text = Util.FormatNumber(Constants.DEFAULT_ATTRIBUTES[attributeName], config.Precision)
+				row.ValueBox.TextColor3 = Theme.TextDim
+			end
+		end
+		self.SuppressNumericSignal = false
+
+		local enemyStates = if model then model.enemyStates else {}
+		for enemyName, row in pairs(self.EnemyRows) do
+			local stateValue = enemyStates[enemyName] or "none"
+			self:_setEnemyRowState(enemyName, stateValue)
+			row.Button.TextColor3 = if self.HasSelection then Theme.Text else Theme.TextDim
+		end
+	end
+
+	function self:SetWidgetEnabled(enabledValue)
+		self.Widget.Enabled = enabledValue == true
+	end
+
+	function self:GetWidgetEnabled()
+		return self.Widget.Enabled
+	end
+
+	function self:Destroy()
+		for _, connection in ipairs(self.Connections) do
+			if connection and connection.Connected then
+				connection:Disconnect()
+			end
+		end
+		self.Connections = {}
+		if self.Widget then
+			self.Widget:Destroy()
+			self.Widget = nil
+		end
+	end
+
+	self:SetEnemyTypes(enemyTypes or {})
+	self:SetPreviewState(true, true)
+	self:UpdateFromSelection({
+		count = 0,
+		hasSelection = false,
+		values = {},
+		enemyStates = {},
+	})
+
+	return self
+end
+
+return UI
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="9">
+        <Properties>
+          <string name="Name">Util</string>
+          <string name="Source"><![CDATA[local Util = {}
+
+function Util.Trim(text)
+	if type(text) ~= "string" then
+		return ""
+	end
+	return (string.gsub(text, "^%s*(.-)%s*$", "%1"))
+end
+
+function Util.CloneArray(list)
+	local copy = {}
+	for index, value in ipairs(list or {}) do
+		copy[index] = value
+	end
+	return copy
+end
+
+function Util.Round(value, precision)
+	local power = math.pow(10, precision or 0)
+	return math.floor(value * power + 0.5) / power
+end
+
+function Util.Clamp(value, minValue, maxValue)
+	if value < minValue then
+		return minValue
+	end
+	if value > maxValue then
+		return maxValue
+	end
+	return value
+end
+
+function Util.ApplyStep(value, step)
+	if not step or step <= 0 then
+		return value
+	end
+	return math.floor((value / step) + 0.5) * step
+end
+
+function Util.SplitCsv(csvText)
+	local result = {}
+	local seen = {}
+	if type(csvText) ~= "string" then
+		return result
+	end
+
+	for token in string.gmatch(csvText, "[^,]+") do
+		local trimmed = Util.Trim(token)
+		if trimmed ~= "" and not seen[trimmed] then
+			seen[trimmed] = true
+			table.insert(result, trimmed)
+		end
+	end
+
+	return result
+end
+
+function Util.JoinCsv(values)
+	local result = {}
+	local seen = {}
+
+	for _, value in ipairs(values or {}) do
+		local text = Util.Trim(tostring(value))
+		if text ~= "" and not seen[text] then
+			seen[text] = true
+			table.insert(result, text)
+		end
+	end
+
+	return table.concat(result, ",")
+end
+
+function Util.ArrayContains(list, target)
+	for _, value in ipairs(list or {}) do
+		if value == target then
+			return true
+		end
+	end
+	return false
+end
+
+function Util.ArrayWithout(list, target)
+	local result = {}
+	for _, value in ipairs(list or {}) do
+		if value ~= target then
+			table.insert(result, value)
+		end
+	end
+	return result
+end
+
+function Util.DedupeArray(list)
+	local result = {}
+	local seen = {}
+	for _, value in ipairs(list or {}) do
+		if not seen[value] then
+			seen[value] = true
+			table.insert(result, value)
+		end
+	end
+	return result
+end
+
+function Util.ResolvePath(pathText)
+	if type(pathText) ~= "string" or pathText == "" then
+		return nil
+	end
+
+	local normalized = pathText
+	normalized = normalized:gsub("^game%.", "")
+	normalized = normalized:gsub("^Game%.", "")
+
+	local current = game
+	for token in string.gmatch(normalized, "[^%.]+") do
+		local nextInstance = nil
+		if current == game then
+			local ok, serviceOrErr = pcall(function()
+				return game:GetService(token)
+			end)
+			if ok and serviceOrErr then
+				nextInstance = serviceOrErr
+			end
+		end
+
+		if not nextInstance then
+			nextInstance = current:FindFirstChild(token)
+		end
+
+		if not nextInstance then
+			return nil
+		end
+
+		current = nextInstance
+	end
+
+	return current
+end
+
+function Util.EnsureFolderPath(pathText)
+	if type(pathText) ~= "string" or pathText == "" then
+		return nil, "Invalid folder path"
+	end
+
+	local normalized = pathText
+	normalized = normalized:gsub("^game%.", "")
+	normalized = normalized:gsub("^Game%.", "")
+
+	local current = game
+	for token in string.gmatch(normalized, "[^%.]+") do
+		local nextInstance = nil
+
+		if current == game then
+			local ok, serviceOrErr = pcall(function()
+				return game:GetService(token)
+			end)
+			if ok and serviceOrErr then
+				nextInstance = serviceOrErr
+			end
+		end
+
+		if not nextInstance then
+			nextInstance = current:FindFirstChild(token)
+		end
+
+		if not nextInstance then
+			local createdFolder = Instance.new("Folder")
+			createdFolder.Name = token
+			createdFolder.Parent = current
+			nextInstance = createdFolder
+		end
+
+		current = nextInstance
+	end
+
+	return current
+end
+
+function Util.InferIslandName(instance)
+	local map = workspace:FindFirstChild("Map")
+	if not map then
+		return nil
+	end
+
+	local islands = map:FindFirstChild("Islands")
+	if not islands then
+		return nil
+	end
+
+	local current = instance
+	while current and current ~= workspace do
+		if current.Parent == islands then
+			return current.Name
+		end
+		current = current.Parent
+	end
+
+	return nil
+end
+
+function Util.FormatNumber(value, precision)
+	local safePrecision = precision or 0
+	if safePrecision <= 0 then
+		return tostring(math.floor(value + 0.5))
+	end
+	local rounded = Util.Round(value, safePrecision)
+	return string.format("%." .. tostring(safePrecision) .. "f", rounded)
+end
+
+return Util
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+</roblox>

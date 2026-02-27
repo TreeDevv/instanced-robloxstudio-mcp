@@ -3,6 +3,9 @@ import { createHttpServer } from '../http-server';
 import { RobloxStudioTools } from '../tools/index';
 import { BridgeService } from '../bridge-service';
 import { Application } from 'express';
+import path from 'path';
+import { promises as fs } from 'fs';
+import { InstanceRegistry } from '../instance-registry';
 
 describe('Integration Tests', () => {
   let app: Application & any;
@@ -201,6 +204,85 @@ describe('Integration Tests', () => {
       await expect(timeoutPromise).rejects.toThrow('Request timeout');
 
       jest.useRealTimers();
+    });
+  });
+
+  describe('Multi-instance Registry Visibility', () => {
+    test('should show multiple running servers and attached place metadata', async () => {
+      const stamp = `${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+      const registryDir = path.join(process.cwd(), '.tmp-integration-registry-tests', stamp);
+      const registryPath = path.join(registryDir, 'instances.json');
+      const sharedRegistry = new InstanceRegistry({ registryPath, staleMs: 60_000 });
+
+      const idA = 'instance-A';
+      const idB = 'instance-B';
+      await sharedRegistry.registerInstance({
+        instanceId: idA,
+        pid: process.pid,
+        host: '127.0.0.1',
+        port: 58741,
+        startedAt: Date.now(),
+        lastSeenAt: Date.now(),
+        mcpServerActive: true,
+        pluginConnected: false,
+        lastPluginActivity: 0,
+      });
+      await sharedRegistry.registerInstance({
+        instanceId: idB,
+        pid: process.pid,
+        host: '127.0.0.1',
+        port: 58742,
+        startedAt: Date.now(),
+        lastSeenAt: Date.now(),
+        mcpServerActive: true,
+        pluginConnected: false,
+        lastPluginActivity: 0,
+      });
+
+      const appA = createHttpServer(tools, bridge, {
+        instanceId: idA,
+        host: '127.0.0.1',
+        port: 58741,
+        registry: sharedRegistry,
+      }) as Application & any;
+      const appB = createHttpServer(tools, bridge, {
+        instanceId: idB,
+        host: '127.0.0.1',
+        port: 58742,
+        registry: sharedRegistry,
+      }) as Application & any;
+
+      appA.setMCPServerActive(true);
+      appB.setMCPServerActive(true);
+
+      await request(appA)
+        .post('/ready')
+        .send({
+          placeName: 'Place-A',
+          placeId: 101,
+          gameId: 'game-a',
+          jobId: 'job-a',
+        })
+        .expect(200);
+
+      const listFromB = await request(appB)
+        .get('/registry/instances')
+        .expect(200);
+
+      const ports = listFromB.body.instances.map((inst: any) => inst.port);
+      expect(ports).toContain(58741);
+      expect(ports).toContain(58742);
+
+      const placeA = listFromB.body.instances.find((inst: any) => inst.port === 58741);
+      expect(placeA.pluginMetadata.placeName).toBe('Place-A');
+      expect(placeA.pluginMetadata.placeId).toBe(101);
+
+      const currentA = await request(appA)
+        .get('/registry/current')
+        .expect(200);
+      expect(currentA.body.instance.instanceId).toBe(idA);
+
+      await fs.rm(registryDir, { recursive: true, force: true });
     });
   });
 });

@@ -9,9 +9,11 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import { createRequire } from 'module';
+import { randomUUID } from 'crypto';
 import { createHttpServer } from './http-server.js';
 import { RobloxStudioTools } from './tools/index.js';
 import { BridgeService } from './bridge-service.js';
+import { InstanceRegistry } from './instance-registry.js';
 
 const require = createRequire(import.meta.url);
 const { version: VERSION } = require('../package.json');
@@ -20,6 +22,10 @@ class RobloxStudioMCPServer {
   private server: Server;
   private tools: RobloxStudioTools;
   private bridge: BridgeService;
+  private registry: InstanceRegistry;
+  private instanceId: string;
+  private transportConnected = false;
+  private clientInitialized = false;
 
   constructor() {
     this.server = new Server(
@@ -30,12 +36,18 @@ class RobloxStudioMCPServer {
       {
         capabilities: {
           tools: {},
+          logging: {},
         },
       }
     );
 
     this.bridge = new BridgeService();
-    this.tools = new RobloxStudioTools(this.bridge);
+    this.registry = new InstanceRegistry();
+    this.instanceId = randomUUID();
+    this.tools = new RobloxStudioTools(this.bridge, this.registry);
+    this.server.oninitialized = () => {
+      this.clientInitialized = true;
+    };
     this.setupToolHandlers();
   }
 
@@ -892,7 +904,23 @@ class RobloxStudioMCPServer {
           },
           {
             name: 'get_playtest_output',
-            description: 'Poll the output buffer without stopping the test. Returns isRunning, captured print/warn/error messages, and any test result. Call repeatedly to monitor a running session — useful for waiting on specific log output or checking if errors have occurred.',
+            description: 'Poll the output buffer without stopping the test. Returns isRunning, captured print/warn/error messages, and any test result. Call repeatedly to monitor a running session - useful for waiting on specific log output or checking if errors have occurred.',
+            inputSchema: {
+              type: 'object',
+              properties: {}
+            }
+          },
+          {
+            name: 'list_mcp_instances',
+            description: 'List all running Roblox Studio MCP server instances on this machine and show which game/place each is connected to, if any.',
+            inputSchema: {
+              type: 'object',
+              properties: {}
+            }
+          },
+          {
+            name: 'get_mcp_instance_context',
+            description: 'Get the current MCP server context including instance ID, bound port, and connected place metadata if available.',
             inputSchema: {
               type: 'object',
               properties: {}
@@ -1004,6 +1032,10 @@ class RobloxStudioMCPServer {
             return await this.tools.stopPlaytest();
           case 'get_playtest_output':
             return await this.tools.getPlaytestOutput();
+          case 'list_mcp_instances':
+            return await this.tools.listMcpInstances();
+          case 'get_mcp_instance_context':
+            return await this.tools.getMcpInstanceContext();
 
           default:
             throw new McpError(
@@ -1021,31 +1053,120 @@ class RobloxStudioMCPServer {
   }
 
   async run() {
-    const basePort = process.env.ROBLOX_STUDIO_PORT ? parseInt(process.env.ROBLOX_STUDIO_PORT) : 58741;
-    const maxPort = basePort + 4;
+    const parsedBasePort = Number.parseInt(process.env.ROBLOX_STUDIO_PORT ?? '', 10);
+    const basePort = Number.isFinite(parsedBasePort) ? parsedBasePort : 58741;
+    const parsedMaxPort = Number.parseInt(process.env.ROBLOX_STUDIO_MAX_PORT ?? '', 10);
+    const maxPort = Number.isFinite(parsedMaxPort)
+      ? Math.min(65535, Math.max(basePort, parsedMaxPort))
+      : 65535;
     const host = process.env.ROBLOX_STUDIO_HOST || '0.0.0.0';
-    const httpServer = createHttpServer(this.tools, this.bridge);
+    const httpServer = createHttpServer(this.tools, this.bridge, {
+      instanceId: this.instanceId,
+      host,
+      port: 0,
+      registry: this.registry,
+    });
+    const listenOnPort = async (
+      app: ReturnType<typeof createHttpServer>,
+      port: number,
+      listenHost: string
+    ) => {
+      await new Promise<void>((resolve, reject) => {
+        const server = app.listen(port, listenHost);
+
+        const onError = (err: NodeJS.ErrnoException) => {
+          server.removeListener('listening', onListening);
+          reject(err);
+        };
+
+        const onListening = () => {
+          server.removeListener('error', onError);
+          resolve();
+        };
+
+        server.once('error', onError);
+        server.once('listening', onListening);
+      });
+    };
+    let lastPrintedStatus = '';
+    const pendingClientLogs: Array<{
+      message: string;
+      level: 'debug' | 'info' | 'warning' | 'error';
+    }> = [];
+    let flushingClientLogs = false;
+    const flushPendingClientLogs = async () => {
+      if (!this.transportConnected || !this.clientInitialized || flushingClientLogs || pendingClientLogs.length === 0) {
+        return;
+      }
+
+      flushingClientLogs = true;
+      try {
+        while (pendingClientLogs.length > 0) {
+          const item = pendingClientLogs.shift()!;
+          await this.server.sendLoggingMessage({
+            level: item.level,
+            logger: 'robloxstudio-mcp',
+            data: item.message,
+          });
+        }
+      } catch {
+      } finally {
+        flushingClientLogs = false;
+      }
+    };
+    const sendClientLog = async (message: string, level: 'debug' | 'info' | 'warning' | 'error' = 'info') => {
+      if (!this.transportConnected || !this.clientInitialized) {
+        const lastPending = pendingClientLogs[pendingClientLogs.length - 1];
+        if (!lastPending || lastPending.message !== message || lastPending.level !== level) {
+          pendingClientLogs.push({ message, level });
+          if (pendingClientLogs.length > 50) {
+            pendingClientLogs.shift();
+          }
+        }
+        return;
+      }
+
+      try {
+        await this.server.sendLoggingMessage({
+          level,
+          logger: 'robloxstudio-mcp',
+          data: message,
+        });
+      } catch {
+      }
+    };
+    const printServerStatus = async (reason: string) => {
+      const instances = await this.registry.listInstances();
+      const payload = {
+        reason,
+        currentInstanceId: this.instanceId,
+        total: instances.length,
+        instances: instances.map((instance) => ({
+          instanceId: instance.instanceId,
+          port: instance.port,
+          host: instance.host,
+          mcpServerActive: instance.mcpServerActive,
+          pluginConnected: instance.pluginConnected,
+          placeName: instance.pluginMetadata?.placeName ?? null,
+          placeId: instance.pluginMetadata?.placeId ?? null,
+          isCurrent: instance.instanceId === this.instanceId,
+        })),
+      };
+      const encoded = JSON.stringify(payload);
+      if (encoded !== lastPrintedStatus) {
+        lastPrintedStatus = encoded;
+        const message = `MCP_SERVERS_STATUS ${encoded}`;
+        console.error(message);
+        await sendClientLog(message, 'info');
+      }
+    };
 
     let boundPort = 0;
     for (let port = basePort; port <= maxPort; port++) {
       try {
-        await new Promise<void>((resolve, reject) => {
-          const onError = (err: NodeJS.ErrnoException) => {
-            if (err.code === 'EADDRINUSE') {
-              httpServer.removeListener('error', onError);
-              reject(err);
-            } else {
-              reject(err);
-            }
-          };
-          httpServer.once('error', onError);
-          httpServer.listen(port, host, () => {
-            httpServer.removeListener('error', onError);
-            boundPort = port;
-            console.error(`HTTP server listening on ${host}:${port} for Studio plugin`);
-            resolve();
-          });
-        });
+        await listenOnPort(httpServer, port, host);
+        boundPort = port;
+        console.error(`HTTP server listening on ${host}:${port} for Studio plugin`);
         break;
       } catch (err: any) {
         if (err.code === 'EADDRINUSE') {
@@ -1059,28 +1180,31 @@ class RobloxStudioMCPServer {
       }
     }
 
+    await this.registry.registerInstance({
+      instanceId: this.instanceId,
+      pid: process.pid,
+      host,
+      port: boundPort,
+      startedAt: Date.now(),
+      lastSeenAt: Date.now(),
+      mcpServerActive: false,
+      pluginConnected: false,
+      lastPluginActivity: 0,
+    });
+    (httpServer as any).setInstanceBinding({ instanceId: this.instanceId, host, port: boundPort });
+    this.tools.setInstanceContext(this.instanceId, host, boundPort);
+    console.error(`MCP_INSTANCE_PORT ${boundPort}`);
+    console.error(`MCP_INSTANCE_STARTED ${JSON.stringify({ instanceId: this.instanceId, host, port: boundPort, pid: process.pid })}`);
+    await printServerStatus('startup');
+
     const LEGACY_PORT = 3002;
     let legacyServer: ReturnType<typeof createHttpServer> | undefined;
     if (boundPort !== LEGACY_PORT) {
       const legacy = createHttpServer(this.tools, this.bridge);
       legacyServer = legacy;
       try {
-        await new Promise<void>((resolve, reject) => {
-          const onError = (err: NodeJS.ErrnoException) => {
-            if (err.code === 'EADDRINUSE') {
-              legacy.removeListener('error', onError);
-              reject(err);
-            } else {
-              reject(err);
-            }
-          };
-          legacy.once('error', onError);
-          legacy.listen(LEGACY_PORT, host, () => {
-            legacy.removeListener('error', onError);
-            console.error(`Legacy HTTP server also listening on ${host}:${LEGACY_PORT} for old plugins`);
-            resolve();
-          });
-        });
+        await listenOnPort(legacy, LEGACY_PORT, host);
+        console.error(`Legacy HTTP server also listening on ${host}:${LEGACY_PORT} for old plugins`);
 
         (legacy as any).setMCPServerActive(true);
       } catch {
@@ -1092,7 +1216,17 @@ class RobloxStudioMCPServer {
 
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
+    this.transportConnected = true;
     console.error('Roblox Studio MCP server running on stdio');
+    await sendClientLog(`MCP_INSTANCE_PORT ${boundPort}`, 'info');
+    await sendClientLog(`MCP_INSTANCE_STARTED ${JSON.stringify({ instanceId: this.instanceId, host, port: boundPort, pid: process.pid })}`, 'info');
+    await printServerStatus('post_connect');
+    const initializedLogInterval = setInterval(() => {
+      if (this.clientInitialized) {
+        void flushPendingClientLogs();
+        clearInterval(initializedLogInterval);
+      }
+    }, 250);
 
     (httpServer as any).setMCPServerActive(true);
     console.error('MCP server marked as active');
@@ -1104,6 +1238,15 @@ class RobloxStudioMCPServer {
       if (legacyServer) (legacyServer as any).trackMCPActivity();
       const pluginConnected = (httpServer as any).isPluginConnected();
       const mcpActive = (httpServer as any).isMCPServerActive();
+      void this.registry.heartbeat(this.instanceId, {
+        host,
+        port: boundPort,
+        mcpServerActive: mcpActive,
+        pluginConnected,
+      }).then(() => {
+        void printServerStatus('heartbeat');
+      }).catch(() => {
+      });
 
       if (pluginConnected && mcpActive) {
       } else if (pluginConnected && !mcpActive) {
@@ -1118,6 +1261,22 @@ class RobloxStudioMCPServer {
     setInterval(() => {
       this.bridge.cleanupOldRequests();
     }, 5000);
+
+    let shuttingDown = false;
+    const shutdown = async () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      await this.registry.removeInstance(this.instanceId).catch(() => {
+      });
+      process.exit(0);
+    };
+
+    process.once('SIGINT', () => {
+      void shutdown();
+    });
+    process.once('SIGTERM', () => {
+      void shutdown();
+    });
   }
 }
 
@@ -1126,3 +1285,4 @@ server.run().catch((error) => {
   console.error('Server failed to start:', error);
   process.exit(1);
 });
+

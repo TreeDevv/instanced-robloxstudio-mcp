@@ -22,7 +22,7 @@ elements.connectButton.Activated:Connect(function()
 	end
 end)
 button.Click:Connect(function()
-	elements.screenGui.Enabled = not elements.screenGui.Enabled
+	UI.toggleScreenGuiVisible()
 end)
 plugin.Unloading:Connect(function()
 	Communication.deactivateAll()
@@ -52,6 +52,8 @@ local InstanceHandlers = TS.import(script, script.Parent, "handlers", "InstanceH
 local ScriptHandlers = TS.import(script, script.Parent, "handlers", "ScriptHandlers")
 local MetadataHandlers = TS.import(script, script.Parent, "handlers", "MetadataHandlers")
 local TestHandlers = TS.import(script, script.Parent, "handlers", "TestHandlers")
+local MAX_DISCOVERY_PORTS = 200
+local REGISTRY_REFRESH_INTERVAL = 2
 local routeMap = {
 	["/api/file-tree"] = QueryHandlers.getFileTree,
 	["/api/search-files"] = QueryHandlers.searchFiles,
@@ -133,6 +135,132 @@ local function getConnectionStatus(connIndex)
 	end
 	return "connecting"
 end
+local function clearConnectionPlace(conn)
+	conn.connectedPlaceName = nil
+	conn.connectedPlaceId = nil
+	conn.connectedGameId = nil
+	conn.connectedJobId = nil
+end
+local function applyStatusToConnection(conn, status)
+	if status.port ~= nil then
+		conn.port = status.port
+		conn.serverUrl = `http://localhost:{status.port}`
+	end
+	local _value = status.instanceId
+	if _value ~= "" and _value then
+		conn.instanceId = status.instanceId
+	end
+	local metadata = status.pluginMetadata
+	if metadata then
+		conn.connectedPlaceName = metadata.placeName
+		conn.connectedPlaceId = metadata.placeId
+		conn.connectedGameId = metadata.gameId
+		conn.connectedJobId = metadata.jobId
+	else
+		clearConnectionPlace(conn)
+	end
+end
+local function fetchStatus(conn)
+	local success, result = pcall(function()
+		return HttpService:RequestAsync({
+			Url = `{conn.serverUrl}/status`,
+			Method = "GET",
+			Headers = {
+				["Content-Type"] = "application/json",
+			},
+		})
+	end)
+	if success and result.Success then
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(result.Body)
+		end)
+		if ok then
+			return data
+		end
+	end
+	return nil
+end
+local function applyRegistryInstances(instances)
+	for _, conn in State.getConnections() do
+		clearConnectionPlace(conn)
+		conn.instanceId = nil
+	end
+	for _, instance in instances do
+		local _exp = State.getConnections()
+		-- ▼ ReadonlyArray.find ▼
+		local _callback = function(conn)
+			return conn.port == instance.port
+		end
+		local _result
+		for _i, _v in _exp do
+			if _callback(_v, _i - 1, _exp) == true then
+				_result = _v
+				break
+			end
+		end
+		-- ▲ ReadonlyArray.find ▲
+		local matching = _result
+		if not matching then
+			continue
+		end
+		matching.instanceId = instance.instanceId
+		local metadata = instance.pluginMetadata
+		if metadata then
+			matching.connectedPlaceName = metadata.placeName
+			matching.connectedPlaceId = metadata.placeId
+			matching.connectedGameId = metadata.gameId
+			matching.connectedJobId = metadata.jobId
+		end
+	end
+	for i = 0, #State.getConnections() - 1 do
+		UI.updateTabDot(i)
+	end
+end
+local function refreshRegistryView(conn)
+	local success, result = pcall(function()
+		return HttpService:RequestAsync({
+			Url = `{conn.serverUrl}/registry/instances`,
+			Method = "GET",
+			Headers = {
+				["Content-Type"] = "application/json",
+			},
+		})
+	end)
+	if success and result.Success then
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(result.Body)
+		end)
+		if ok and data.instances then
+			applyRegistryInstances(data.instances)
+			local active = State.getActiveConnection()
+			local _exp = data.instances
+			local _result = active
+			if _result ~= nil then
+				_result = _result.port
+			end
+			UI.updateServerRegistry(_exp, _result)
+		end
+	end
+end
+local function maybeRefreshContext(conn)
+	local now = tick()
+	if now - conn.lastRegistryFetch < REGISTRY_REFRESH_INTERVAL then
+		return nil
+	end
+	conn.lastRegistryFetch = now
+	task.spawn(function()
+		local status = fetchStatus(conn)
+		if status then
+			applyStatusToConnection(conn, status)
+			local active = State.getActiveConnection()
+			if active == conn then
+				local ui = UI.getElements()
+				ui.urlInput.Text = conn.serverUrl
+			end
+		end
+		refreshRegistryView(conn)
+	end)
+end
 local function pollForRequests(connIndex)
 	local conn = State.getConnection(connIndex)
 	if not conn or not conn.isActive then
@@ -161,6 +289,7 @@ local function pollForRequests(connIndex)
 		local data = HttpService:JSONDecode(result.Body)
 		local mcpConnected = data.mcpConnected == true
 		conn.lastHttpOk = true
+		maybeRefreshContext(conn)
 		if connIndex == State.getActiveTabIndex() then
 			local el = ui
 			el.step1Dot.BackgroundColor3 = Color3.fromRGB(34, 197, 94)
@@ -226,6 +355,7 @@ local function pollForRequests(connIndex)
 		end
 	elseif conn.isActive then
 		conn.consecutiveFailures += 1
+		conn.lastHttpOk = false
 		if conn.consecutiveFailures > 1 then
 			conn.currentRetryDelay = math.min(conn.currentRetryDelay * conn.retryBackoffMultiplier, conn.maxRetryDelay)
 		end
@@ -288,7 +418,8 @@ local function pollForRequests(connIndex)
 	end
 end
 local function discoverPort()
-	for offset = 0, 4 do
+	local fallbackPort
+	for offset = 0, MAX_DISCOVERY_PORTS - 1 do
 		local port = State.BASE_PORT + offset
 		local success, result = pcall(function()
 			return HttpService:RequestAsync({
@@ -303,12 +434,17 @@ local function discoverPort()
 			local ok, data = pcall(function()
 				return HttpService:JSONDecode(result.Body)
 			end)
-			if ok and data.pluginConnected == false then
-				return port
+			if ok then
+				if data.pluginConnected == false then
+					return port
+				end
+				if fallbackPort == nil then
+					fallbackPort = port
+				end
 			end
 		end
 	end
-	return nil
+	return fallbackPort
 end
 local function activatePlugin(connIndex)
 	local _condition = connIndex
@@ -324,7 +460,7 @@ local function activatePlugin(connIndex)
 	conn.isActive = true
 	conn.consecutiveFailures = 0
 	conn.currentRetryDelay = 0.5
-	ui.screenGui.Enabled = true
+	UI.setScreenGuiVisible(true)
 	if idx == State.getActiveTabIndex() then
 		conn.serverUrl = ui.urlInput.Text
 		local portStr = string.match(conn.serverUrl, ":(%d+)$")
@@ -357,6 +493,14 @@ local function activatePlugin(connIndex)
 				ui.urlInput.Text = conn.serverUrl
 			end
 		end
+		local status = fetchStatus(conn)
+		if status then
+			applyStatusToConnection(conn, status)
+			if idx == State.getActiveTabIndex() then
+				ui.urlInput.Text = conn.serverUrl
+			end
+		end
+		UI.updateTabDot(idx)
 		pcall(function()
 			HttpService:RequestAsync({
 				Url = `{conn.serverUrl}/ready`,
@@ -367,9 +511,15 @@ local function activatePlugin(connIndex)
 				Body = HttpService:JSONEncode({
 					pluginReady = true,
 					timestamp = tick(),
+					placeName = game.Name,
+					placeId = game.PlaceId,
+					gameId = tostring(game.GameId),
+					jobId = tostring(game.JobId),
 				}),
 			})
 		end)
+		conn.lastRegistryFetch = 0
+		maybeRefreshContext(conn)
 	end)
 end
 local function deactivatePlugin(connIndex)
@@ -383,6 +533,8 @@ local function deactivatePlugin(connIndex)
 		return nil
 	end
 	conn.isActive = false
+	conn.lastHttpOk = false
+	clearConnectionPlace(conn)
 	if idx == State.getActiveTabIndex() then
 		UI.updateUIState()
 	end
@@ -405,6 +557,7 @@ local function deactivatePlugin(connIndex)
 	end
 	conn.consecutiveFailures = 0
 	conn.currentRetryDelay = 0.5
+	conn.lastRegistryFetch = 0
 end
 local function deactivateAll()
 	for i = 0, #State.getConnections() - 1 do
@@ -3194,6 +3347,12 @@ local function createConnection(port)
 		mcpWaitStartTime = nil,
 		isPolling = false,
 		heartbeatConnection = nil,
+		lastRegistryFetch = 0,
+		instanceId = nil,
+		connectedPlaceName = nil,
+		connectedPlaceId = nil,
+		connectedGameId = nil,
+		connectedJobId = nil,
 	}
 end
 local connections = { createConnection(BASE_PORT) }
@@ -3270,10 +3429,72 @@ local State = TS.import(script, script.Parent, "State")
 local elements = nil
 local pulseAnimation
 local buttonHover = false
+local lastRegistryInstances = {}
+local openTween
+local isOpenAnimating = false
 local tabButtons = {}
 local TWEEN_QUICK = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local TWEEN_OPEN = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local MAIN_FRAME_FINAL_ANCHOR = Vector2.new(0.5, 0)
+local MAIN_FRAME_FINAL_POSITION = UDim2.new(0.5, 0, 0, 0)
+local MAIN_FRAME_FINAL_SIZE = UDim2.new(1, 0, 1, 0)
+local MAIN_FRAME_OPEN_START_POSITION = UDim2.new(0.5, 0, 1.06, 0)
+local MAIN_FRAME_OPEN_START_SIZE = UDim2.new(0, 0, 1, 0)
 local function tweenProp(instance, props)
 	TweenService:Create(instance, TWEEN_QUICK, props):Play()
+end
+local function setMainFrameFinalPose(mainFrame)
+	mainFrame.AnchorPoint = MAIN_FRAME_FINAL_ANCHOR
+	mainFrame.Position = MAIN_FRAME_FINAL_POSITION
+	mainFrame.Size = MAIN_FRAME_FINAL_SIZE
+end
+local function setMainFrameOpenStartPose(mainFrame)
+	mainFrame.AnchorPoint = MAIN_FRAME_FINAL_ANCHOR
+	mainFrame.Position = MAIN_FRAME_OPEN_START_POSITION
+	mainFrame.Size = MAIN_FRAME_OPEN_START_SIZE
+end
+local function setScreenGuiVisible(visible)
+	if not elements then
+		return nil
+	end
+	local _binding = elements
+	local screenGui = _binding.screenGui
+	local mainFrame = _binding.mainFrame
+	if openTween then
+		openTween:Cancel()
+		openTween = nil
+	end
+	if not visible then
+		isOpenAnimating = false
+		setMainFrameFinalPose(mainFrame)
+		screenGui.Enabled = false
+		return nil
+	end
+	if screenGui.Enabled and not isOpenAnimating then
+		setMainFrameFinalPose(mainFrame)
+		return nil
+	end
+	screenGui.Enabled = true
+	isOpenAnimating = true
+	setMainFrameOpenStartPose(mainFrame)
+	openTween = TweenService:Create(mainFrame, TWEEN_OPEN, {
+		Position = MAIN_FRAME_FINAL_POSITION,
+		Size = MAIN_FRAME_FINAL_SIZE,
+	})
+	local completedConn
+	completedConn = openTween.Completed:Connect(function()
+		completedConn:Disconnect()
+		openTween = nil
+		isOpenAnimating = false
+		setMainFrameFinalPose(mainFrame)
+	end)
+	openTween:Play()
+end
+local function toggleScreenGuiVisible()
+	if not elements then
+		return nil
+	end
+	setScreenGuiVisible(not elements.screenGui.Enabled)
 end
 local C = {
 	bg = Color3.fromRGB(14, 14, 14),
@@ -3291,6 +3512,25 @@ local C = {
 	gray = Color3.fromRGB(120, 120, 120),
 }
 local CORNER = UDim.new(0, 4)
+local MAX_TAB_PLACE_LEN = 8
+local function truncate(text, maxLen)
+	if #text <= maxLen then
+		return text
+	end
+	local _text = text
+	local _arg1 = maxLen - 1
+	return `{string.sub(_text, 1, _arg1)}.`
+end
+local function getTabLabel(conn)
+	local _condition = conn.connectedPlaceName
+	if _condition ~= "" and _condition then
+		_condition = #conn.connectedPlaceName > 0
+	end
+	if _condition ~= "" and _condition then
+		return `{conn.port} {truncate(conn.connectedPlaceName, MAX_TAB_PLACE_LEN)}`
+	end
+	return tostring(conn.port)
+end
 local function getStatusDotColor(connIndex)
 	local conn = State.getConnection(connIndex)
 	if not conn or not conn.isActive then
@@ -3335,7 +3575,7 @@ local function createTabButton(connIndex)
 	end
 	local isActive = connIndex == State.getActiveTabIndex()
 	local tabFrame = Instance.new("Frame")
-	tabFrame.Size = UDim2.new(0, 58, 1, -6)
+	tabFrame.Size = UDim2.new(0, 96, 1, -6)
 	tabFrame.Position = UDim2.new(0, 0, 0, 3)
 	tabFrame.BackgroundColor3 = if isActive then C.surface else C.bg
 	tabFrame.BackgroundTransparency = if isActive then 0 else 0.5
@@ -3357,7 +3597,7 @@ local function createTabButton(connIndex)
 	label.Size = UDim2.new(1, -26, 1, 0)
 	label.Position = UDim2.new(0, 14, 0, 0)
 	label.BackgroundTransparency = 1
-	label.Text = tostring(conn.port)
+	label.Text = getTabLabel(conn)
 	label.TextColor3 = if isActive then C.label else C.muted
 	label.TextSize = 10
 	label.Font = Enum.Font.GothamMedium
@@ -3436,7 +3676,7 @@ refreshTabBar = function()
 	end
 	-- ▲ ReadonlyMap.forEach ▲
 end
-local updateUIState
+local updateUIState, updateServerRegistry
 switchToTab = function(index)
 	if index < 0 or index >= #State.getConnections() then
 		return nil
@@ -3462,6 +3702,7 @@ switchToTab = function(index)
 	-- ▲ ReadonlyMap.forEach ▲
 	elements.urlInput.Text = conn.serverUrl
 	updateUIState()
+	updateServerRegistry(lastRegistryInstances, conn.port)
 end
 local function updateTabDot(connIndex)
 	local _tabButtons = tabButtons
@@ -3470,13 +3711,101 @@ local function updateTabDot(connIndex)
 	if tb and tb.dot then
 		tb.dot.BackgroundColor3 = getStatusDotColor(connIndex)
 	end
+	local conn = State.getConnection(connIndex)
+	if tb and tb.label and conn then
+		tb.label.Text = getTabLabel(conn)
+	end
+end
+function updateServerRegistry(instances, currentPort)
+	lastRegistryInstances = instances
+	if not elements then
+		return nil
+	end
+	local activeConn = State.getActiveConnection()
+	local _condition = currentPort
+	if _condition == nil then
+		local _result = activeConn
+		if _result ~= nil then
+			_result = _result.port
+		end
+		_condition = _result
+	end
+	local contextPort = _condition
+	local currentPlace = "none"
+	if contextPort ~= nil then
+		-- ▼ ReadonlyArray.find ▼
+		local _callback = function(inst)
+			return inst.port == contextPort
+		end
+		local _result
+		for _i, _v in instances do
+			if _callback(_v, _i - 1, instances) == true then
+				_result = _v
+				break
+			end
+		end
+		-- ▲ ReadonlyArray.find ▲
+		local currentInstance = _result
+		local _result_1 = currentInstance
+		if _result_1 ~= nil then
+			_result_1 = _result_1.pluginMetadata
+			if _result_1 ~= nil then
+				_result_1 = _result_1.placeName
+			end
+		end
+		if _result_1 ~= "" and _result_1 then
+			currentPlace = currentInstance.pluginMetadata.placeName
+		end
+	end
+	if contextPort ~= nil then
+		elements.currentContextLabel.Text = `Current context: {contextPort} | place: {currentPlace}`
+	else
+		elements.currentContextLabel.Text = "Current context: none"
+	end
+	if #instances == 0 then
+		elements.serverListLabel.Text = "No running MCP servers discovered."
+		return nil
+	end
+	local rows = {}
+	local maxRows = math.min(#instances, 8)
+	do
+		local i = 0
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				i += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (i < maxRows) then
+				break
+			end
+			local inst = instances[i + 1]
+			local _result = inst.pluginMetadata
+			if _result ~= nil then
+				_result = _result.placeName
+			end
+			local _condition_1 = _result
+			if _condition_1 == nil then
+				_condition_1 = "none"
+			end
+			local place = _condition_1
+			local marker = if inst.port == contextPort then ">" else " "
+			local pluginState = if inst.pluginConnected then "plugin:on" else "plugin:off"
+			local _arg0 = `{marker} {inst.port} | {pluginState} | {place}`
+			table.insert(rows, _arg0)
+		end
+	end
+	elements.serverListLabel.Text = table.concat(rows, "\n")
 end
 local function init(pluginRef)
 	local CURRENT_VERSION = State.CURRENT_VERSION
 	local screenGui = pluginRef:CreateDockWidgetPluginGuiAsync("MCPServerInterface", DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 300, 260, 260, 200))
 	screenGui.Title = `MCP Server v{CURRENT_VERSION}`
 	local mainFrame = Instance.new("Frame")
-	mainFrame.Size = UDim2.new(1, 0, 1, 0)
+	mainFrame.AnchorPoint = MAIN_FRAME_FINAL_ANCHOR
+	mainFrame.Position = MAIN_FRAME_FINAL_POSITION
+	mainFrame.Size = MAIN_FRAME_FINAL_SIZE
 	mainFrame.BackgroundColor3 = C.bg
 	mainFrame.BorderSizePixel = 0
 	mainFrame.Parent = screenGui
@@ -3751,6 +4080,29 @@ local function init(pluginRef)
 	troubleshootLabel.TextXAlignment = Enum.TextXAlignment.Left
 	troubleshootLabel.LayoutOrder = 4
 	troubleshootLabel.Parent = card
+	local currentContextLabel = Instance.new("TextLabel")
+	currentContextLabel.Size = UDim2.new(1, 0, 0, 14)
+	currentContextLabel.BackgroundTransparency = 1
+	currentContextLabel.Text = "Current context: none"
+	currentContextLabel.TextColor3 = C.dim
+	currentContextLabel.TextSize = 9
+	currentContextLabel.Font = Enum.Font.GothamMedium
+	currentContextLabel.TextXAlignment = Enum.TextXAlignment.Left
+	currentContextLabel.TextWrapped = true
+	currentContextLabel.LayoutOrder = 5
+	currentContextLabel.Parent = card
+	local serverListLabel = Instance.new("TextLabel")
+	serverListLabel.Size = UDim2.new(1, 0, 0, 56)
+	serverListLabel.BackgroundTransparency = 1
+	serverListLabel.Text = "No running MCP servers discovered."
+	serverListLabel.TextColor3 = C.dim
+	serverListLabel.TextSize = 9
+	serverListLabel.Font = Enum.Font.GothamMedium
+	serverListLabel.TextXAlignment = Enum.TextXAlignment.Left
+	serverListLabel.TextYAlignment = Enum.TextYAlignment.Top
+	serverListLabel.TextWrapped = true
+	serverListLabel.LayoutOrder = 6
+	serverListLabel.Parent = card
 	local connectButton = Instance.new("TextButton")
 	connectButton.Size = UDim2.new(1, 0, 0, 28)
 	connectButton.BackgroundColor3 = C.surface
@@ -3760,7 +4112,7 @@ local function init(pluginRef)
 	connectButton.TextColor3 = C.white
 	connectButton.TextSize = 11
 	connectButton.Font = Enum.Font.GothamBold
-	connectButton.LayoutOrder = 5
+	connectButton.LayoutOrder = 7
 	connectButton.Parent = card
 	local connectCorner = Instance.new("UICorner")
 	connectCorner.CornerRadius = CORNER
@@ -3816,6 +4168,8 @@ local function init(pluginRef)
 		step3Dot = step3Dot,
 		step3Label = step3Label,
 		troubleshootLabel = troubleshootLabel,
+		currentContextLabel = currentContextLabel,
+		serverListLabel = serverListLabel,
 		updateBanner = updateBanner,
 		updateBannerText = updateBannerText,
 		tabBar = tabBar,
@@ -3879,11 +4233,17 @@ return {
 	init = init,
 	updateUIState = updateUIState,
 	updateTabDot = updateTabDot,
+	updateServerRegistry = updateServerRegistry,
+	refreshTabBar = function()
+		return refreshTabBar()
+	end,
 	stopPulseAnimation = stopPulseAnimation,
 	startPulseAnimation = startPulseAnimation,
 	getElements = function()
 		return elements
 	end,
+	setScreenGuiVisible = setScreenGuiVisible,
+	toggleScreenGuiVisible = toggleScreenGuiVisible,
 }
 ]]></string>
         </Properties>

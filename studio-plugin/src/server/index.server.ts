@@ -22,7 +22,7 @@ elements.connectButton.Activated.Connect(() => {
 
 
 button.Click.Connect(() => {
-	elements.screenGui.Enabled = !elements.screenGui.Enabled;
+	UI.toggleScreenGuiVisible();
 });
 
 

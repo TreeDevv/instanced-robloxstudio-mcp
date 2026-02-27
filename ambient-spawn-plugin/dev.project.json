@@ -1,0 +1,14 @@
+{
+  "name": "AmbientSpawnPlugin-Dev",
+  "tree": {
+    "$className": "DataModel",
+    "ServerStorage": {
+      "AmbientSpawnPlugin": {
+        "$path": "plugin.server.lua",
+        "src": {
+          "$path": "src"
+        }
+      }
+    }
+  }
+}

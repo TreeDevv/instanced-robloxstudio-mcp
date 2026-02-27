@@ -22,6 +22,12 @@ function createConnection(port: number): Connection {
 		mcpWaitStartTime: undefined,
 		isPolling: false,
 		heartbeatConnection: undefined,
+		lastRegistryFetch: 0,
+		instanceId: undefined,
+		connectedPlaceName: undefined,
+		connectedPlaceId: undefined,
+		connectedGameId: undefined,
+		connectedJobId: undefined,
 	};
 }
 

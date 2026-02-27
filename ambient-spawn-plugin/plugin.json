@@ -1,0 +1,8 @@
+{
+  "Name": "Ambient Spawn Authoring Plugin",
+  "Description": "Create and tune ambient enemy spawn nodes with radius and max-enemy previews.",
+  "Author": "Ambient Tools",
+  "Version": "0.1.0",
+  "Id": "ambient-spawn-authoring-plugin",
+  "Permissions": []
+}

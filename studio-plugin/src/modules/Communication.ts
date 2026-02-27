@@ -8,9 +8,19 @@ import InstanceHandlers from "./handlers/InstanceHandlers";
 import ScriptHandlers from "./handlers/ScriptHandlers";
 import MetadataHandlers from "./handlers/MetadataHandlers";
 import TestHandlers from "./handlers/TestHandlers";
-import { Connection, RequestPayload, PollResponse } from "../types";
+import {
+	Connection,
+	PollResponse,
+	RegistryInstance,
+	RegistryInstancesResponse,
+	RequestPayload,
+	StatusResponse,
+} from "../types";
 
 type Handler = (data: Record<string, unknown>) => unknown;
+
+const MAX_DISCOVERY_PORTS = 200;
+const REGISTRY_REFRESH_INTERVAL = 2;
 
 const routeMap: Record<string, Handler> = {
 
@@ -91,6 +101,117 @@ function getConnectionStatus(connIndex: number): string {
 	return "connecting";
 }
 
+function clearConnectionPlace(conn: Connection) {
+	conn.connectedPlaceName = undefined;
+	conn.connectedPlaceId = undefined;
+	conn.connectedGameId = undefined;
+	conn.connectedJobId = undefined;
+}
+
+function applyStatusToConnection(conn: Connection, status: StatusResponse) {
+	if (status.port !== undefined) {
+		conn.port = status.port;
+		conn.serverUrl = `http://localhost:${status.port}`;
+	}
+	if (status.instanceId) {
+		conn.instanceId = status.instanceId;
+	}
+
+	const metadata = status.pluginMetadata;
+	if (metadata) {
+		conn.connectedPlaceName = metadata.placeName;
+		conn.connectedPlaceId = metadata.placeId;
+		conn.connectedGameId = metadata.gameId;
+		conn.connectedJobId = metadata.jobId;
+	} else {
+		clearConnectionPlace(conn);
+	}
+}
+
+function fetchStatus(conn: Connection): StatusResponse | undefined {
+	const [success, result] = pcall(() => {
+		return HttpService.RequestAsync({
+			Url: `${conn.serverUrl}/status`,
+			Method: "GET",
+			Headers: { "Content-Type": "application/json" },
+		});
+	});
+
+	if (success && result.Success) {
+		const [ok, data] = pcall(() => HttpService.JSONDecode(result.Body) as StatusResponse);
+		if (ok) {
+			return data;
+		}
+	}
+
+	return undefined;
+}
+
+function applyRegistryInstances(instances: RegistryInstance[]) {
+	for (const conn of State.getConnections()) {
+		clearConnectionPlace(conn);
+		conn.instanceId = undefined;
+	}
+
+	for (const instance of instances) {
+		const matching = State.getConnections().find((conn) => conn.port === instance.port);
+		if (!matching) continue;
+
+		matching.instanceId = instance.instanceId;
+		const metadata = instance.pluginMetadata;
+		if (metadata) {
+			matching.connectedPlaceName = metadata.placeName;
+			matching.connectedPlaceId = metadata.placeId;
+			matching.connectedGameId = metadata.gameId;
+			matching.connectedJobId = metadata.jobId;
+		}
+	}
+
+	for (let i = 0; i < State.getConnections().size(); i++) {
+		UI.updateTabDot(i);
+	}
+}
+
+function refreshRegistryView(conn: Connection) {
+	const [success, result] = pcall(() => {
+		return HttpService.RequestAsync({
+			Url: `${conn.serverUrl}/registry/instances`,
+			Method: "GET",
+			Headers: { "Content-Type": "application/json" },
+		});
+	});
+
+	if (success && result.Success) {
+		const [ok, data] = pcall(() => HttpService.JSONDecode(result.Body) as RegistryInstancesResponse);
+		if (ok && data.instances) {
+			applyRegistryInstances(data.instances);
+			const active = State.getActiveConnection();
+			UI.updateServerRegistry(data.instances, active?.port);
+		}
+	}
+}
+
+function maybeRefreshContext(conn: Connection) {
+	const now = tick();
+	if (now - conn.lastRegistryFetch < REGISTRY_REFRESH_INTERVAL) {
+		return;
+	}
+
+	conn.lastRegistryFetch = now;
+	task.spawn(() => {
+		const status = fetchStatus(conn);
+		if (status) {
+			applyStatusToConnection(conn, status);
+			const active = State.getActiveConnection();
+			if (active === conn) {
+				const ui = UI.getElements();
+				ui.urlInput.Text = conn.serverUrl;
+			}
+		}
+		refreshRegistryView(conn);
+	});
+}
+
 function pollForRequests(connIndex: number) {
 	const conn = State.getConnection(connIndex);
 	if (!conn || !conn.isActive) return;
@@ -119,6 +240,7 @@ function pollForRequests(connIndex: number) {
 		const data = HttpService.JSONDecode(result.Body) as PollResponse;
 		const mcpConnected = data.mcpConnected === true;
 		conn.lastHttpOk = true;
+		maybeRefreshContext(conn);
 
 		if (connIndex === State.getActiveTabIndex()) {
 			const el = ui;
@@ -173,6 +295,7 @@ function pollForRequests(connIndex: number) {
 		}
 	} else if (conn.isActive) {
 		conn.consecutiveFailures++;
+		conn.lastHttpOk = false;
 
 		if (conn.consecutiveFailures > 1) {
 			conn.currentRetryDelay = math.min(
@@ -241,7 +364,9 @@ function pollForRequests(connIndex: number) {
 }
 
 function discoverPort(): number | undefined {
-	for (let offset = 0; offset < 5; offset++) {
+	let fallbackPort: number | undefined;
+
+	for (let offset = 0; offset < MAX_DISCOVERY_PORTS; offset++) {
 		const port = State.BASE_PORT + offset;
 		const [success, result] = pcall(() => {
 			return HttpService.RequestAsync({
@@ -252,13 +377,18 @@ function discoverPort(): number | undefined {
 		});
 
 		if (success && result.Success) {
-			const [ok, data] = pcall(() => HttpService.JSONDecode(result.Body) as { pluginConnected: boolean });
-			if (ok && data.pluginConnected === false) {
-				return port;
+			const [ok, data] = pcall(() => HttpService.JSONDecode(result.Body) as StatusResponse);
+			if (ok) {
+				if (data.pluginConnected === false) {
+					return port;
+				}
+				if (fallbackPort === undefined) {
+					fallbackPort = port;
+				}
 			}
 		}
 	}
-	return undefined;
+	return fallbackPort;
 }
 
 function activatePlugin(connIndex?: number) {
@@ -271,7 +401,7 @@ function activatePlugin(connIndex?: number) {
 	conn.isActive = true;
 	conn.consecutiveFailures = 0;
 	conn.currentRetryDelay = 0.5;
-	ui.screenGui.Enabled = true;
+	UI.setScreenGuiVisible(true);
 
 	if (idx === State.getActiveTabIndex()) {
 		conn.serverUrl = ui.urlInput.Text;
@@ -302,14 +432,33 @@ function activatePlugin(connIndex?: number) {
 			}
 		}
 
+		const status = fetchStatus(conn);
+		if (status) {
+			applyStatusToConnection(conn, status);
+			if (idx === State.getActiveTabIndex()) {
+				ui.urlInput.Text = conn.serverUrl;
+			}
+		}
+		UI.updateTabDot(idx);
+
 		pcall(() => {
 			HttpService.RequestAsync({
 				Url: `${conn.serverUrl}/ready`,
 				Method: "POST",
 				Headers: { "Content-Type": "application/json" },
-				Body: HttpService.JSONEncode({ pluginReady: true, timestamp: tick() }),
+				Body: HttpService.JSONEncode({
+					pluginReady: true,
+					timestamp: tick(),
+					placeName: game.Name,
+					placeId: game.PlaceId,
+					gameId: tostring(game.GameId),
+					jobId: tostring(game.JobId),
+				}),
 			});
 		});
+
+		conn.lastRegistryFetch = 0;
+		maybeRefreshContext(conn);
 	});
 }
 
@@ -319,6 +468,8 @@ function deactivatePlugin(connIndex?: number) {
 	if (!conn) return;
 
 	conn.isActive = false;
+	conn.lastHttpOk = false;
+	clearConnectionPlace(conn);
 
 	if (idx === State.getActiveTabIndex()) UI.updateUIState();
 	UI.updateTabDot(idx);
@@ -339,6 +490,7 @@ function deactivatePlugin(connIndex?: number) {
 
 	conn.consecutiveFailures = 0;
 	conn.currentRetryDelay = 0.5;
+	conn.lastRegistryFetch = 0;
 }
 
 function deactivateAll() {

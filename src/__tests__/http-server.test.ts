@@ -3,6 +3,9 @@ import { createHttpServer } from '../http-server';
 import { RobloxStudioTools } from '../tools/index';
 import { BridgeService } from '../bridge-service';
 import { Application } from 'express';
+import path from 'path';
+import { promises as fs } from 'fs';
+import { InstanceRegistry } from '../instance-registry';
 
 describe('HTTP Server', () => {
   let app: Application & any;
@@ -228,6 +231,81 @@ describe('HTTP Server', () => {
       });
       expect(response.body.lastMCPActivity).toBeGreaterThan(0);
       expect(response.body.uptime).toBeGreaterThan(0);
+    });
+  });
+
+  describe('Registry Endpoints', () => {
+    test('should expose current and global instance context', async () => {
+      const stamp = `${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+      const registryDir = path.join(process.cwd(), '.tmp-http-registry-tests', stamp);
+      const registryPath = path.join(registryDir, 'instances.json');
+      const registry = new InstanceRegistry({ registryPath, staleMs: 60_000 });
+      const instanceId = 'instance-http-test';
+
+      await registry.registerInstance({
+        instanceId,
+        pid: process.pid,
+        host: '127.0.0.1',
+        port: 58741,
+        startedAt: Date.now(),
+        lastSeenAt: Date.now(),
+        mcpServerActive: false,
+        pluginConnected: false,
+        lastPluginActivity: 0,
+      });
+
+      const contextualApp = createHttpServer(tools, bridge, {
+        instanceId,
+        host: '127.0.0.1',
+        port: 58741,
+        registry,
+      }) as Application & any;
+
+      await request(contextualApp)
+        .post('/ready')
+        .send({
+          placeName: 'TowerDefense',
+          placeId: 445566,
+          gameId: 'game-id',
+          jobId: 'job-id',
+        })
+        .expect(200);
+
+      contextualApp.setMCPServerActive(true);
+
+      const status = await request(contextualApp)
+        .get('/status')
+        .expect(200);
+
+      expect(status.body).toMatchObject({
+        instanceId,
+        port: 58741,
+        pluginConnected: true,
+        mcpServerActive: true,
+      });
+      expect(status.body.pluginMetadata?.placeName).toBe('TowerDefense');
+      expect(status.body.pluginMetadata?.placeId).toBe(445566);
+
+      const list = await request(contextualApp)
+        .get('/registry/instances')
+        .expect(200);
+
+      expect(Array.isArray(list.body.instances)).toBe(true);
+      expect(list.body.instances[0]).toMatchObject({
+        instanceId,
+        port: 58741,
+      });
+
+      const current = await request(contextualApp)
+        .get('/registry/current')
+        .expect(200);
+
+      expect(current.body.instance).toMatchObject({
+        instanceId,
+        port: 58741,
+      });
+
+      await fs.rm(registryDir, { recursive: true, force: true });
     });
   });
 });

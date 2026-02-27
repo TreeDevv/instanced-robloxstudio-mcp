@@ -1,6 +1,6 @@
 import { TweenService } from "@rbxts/services";
 import State from "./State";
-import { Connection } from "../types";
+import { Connection, RegistryInstance } from "../types";
 
 interface UIElements {
 	screenGui: DockWidgetPluginGui;
@@ -21,6 +21,8 @@ interface UIElements {
 	step3Dot: Frame;
 	step3Label: TextLabel;
 	troubleshootLabel: TextLabel;
+	currentContextLabel: TextLabel;
+	serverListLabel: TextLabel;
 	updateBanner: Frame;
 	updateBannerText: TextLabel;
 	tabBar: Frame;
@@ -29,6 +31,9 @@ interface UIElements {
 let elements: UIElements = undefined!;
 let pulseAnimation: Tween | undefined;
 let buttonHover = false;
+let lastRegistryInstances: RegistryInstance[] = [];
+let openTween: Tween | undefined;
+let isOpenAnimating = false;
 
 interface TabButton {
 	frame: Frame;
@@ -39,9 +44,73 @@ interface TabButton {
 let tabButtons: Map<number, TabButton> = new Map();
 
 const TWEEN_QUICK = new TweenInfo(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out);
+const TWEEN_OPEN = new TweenInfo(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out);
+const MAIN_FRAME_FINAL_ANCHOR = new Vector2(0.5, 0);
+const MAIN_FRAME_FINAL_POSITION = new UDim2(0.5, 0, 0, 0);
+const MAIN_FRAME_FINAL_SIZE = new UDim2(1, 0, 1, 0);
+const MAIN_FRAME_OPEN_START_POSITION = new UDim2(0.5, 0, 1.06, 0);
+const MAIN_FRAME_OPEN_START_SIZE = new UDim2(0, 0, 1, 0);
 
 function tweenProp(instance: Instance, props: Record<string, unknown>) {
 	TweenService.Create(instance, TWEEN_QUICK, props as unknown as { [key: string]: unknown }).Play();
+}
+
+function setMainFrameFinalPose(mainFrame: Frame) {
+	mainFrame.AnchorPoint = MAIN_FRAME_FINAL_ANCHOR;
+	mainFrame.Position = MAIN_FRAME_FINAL_POSITION;
+	mainFrame.Size = MAIN_FRAME_FINAL_SIZE;
+}
+
+function setMainFrameOpenStartPose(mainFrame: Frame) {
+	mainFrame.AnchorPoint = MAIN_FRAME_FINAL_ANCHOR;
+	mainFrame.Position = MAIN_FRAME_OPEN_START_POSITION;
+	mainFrame.Size = MAIN_FRAME_OPEN_START_SIZE;
+}
+
+function setScreenGuiVisible(visible: boolean) {
+	if (!elements) return;
+
+	const { screenGui, mainFrame } = elements;
+
+	if (openTween) {
+		openTween.Cancel();
+		openTween = undefined;
+	}
+
+	if (!visible) {
+		isOpenAnimating = false;
+		setMainFrameFinalPose(mainFrame);
+		screenGui.Enabled = false;
+		return;
+	}
+
+	if (screenGui.Enabled && !isOpenAnimating) {
+		setMainFrameFinalPose(mainFrame);
+		return;
+	}
+
+	screenGui.Enabled = true;
+	isOpenAnimating = true;
+	setMainFrameOpenStartPose(mainFrame);
+
+	openTween = TweenService.Create(mainFrame, TWEEN_OPEN, {
+		Position: MAIN_FRAME_FINAL_POSITION,
+		Size: MAIN_FRAME_FINAL_SIZE,
+	});
+
+	const completedConn = openTween.Completed.Connect(() => {
+		completedConn.Disconnect();
+		openTween = undefined;
+		isOpenAnimating = false;
+		setMainFrameFinalPose(mainFrame);
+	});
+
+	openTween.Play();
+}
+
+function toggleScreenGuiVisible() {
+	if (!elements) return;
+	setScreenGuiVisible(!elements.screenGui.Enabled);
 }
 
 const C = {
@@ -61,6 +130,19 @@ const C = {
 };
 
 const CORNER = new UDim(0, 4);
+const MAX_TAB_PLACE_LEN = 8;
+
+function truncate(text: string, maxLen: number): string {
+	if (text.size() <= maxLen) return text;
+	return `${text.sub(1, maxLen - 1)}.`;
+}
+
+function getTabLabel(conn: Connection): string {
+	if (conn.connectedPlaceName && conn.connectedPlaceName.size() > 0) {
+		return `${conn.port} ${truncate(conn.connectedPlaceName, MAX_TAB_PLACE_LEN)}`;
+	}
+	return tostring(conn.port);
+}
 
 function getStatusDotColor(connIndex: number): Color3 {
 	const conn = State.getConnection(connIndex);
@@ -106,7 +188,7 @@ function createTabButton(connIndex: number) {
 	const isActive = connIndex === State.getActiveTabIndex();
 
 	const tabFrame = new Instance("Frame");
-	tabFrame.Size = new UDim2(0, 58, 1, -6);
+	tabFrame.Size = new UDim2(0, 96, 1, -6);
 	tabFrame.Position = new UDim2(0, 0, 0, 3);
 	tabFrame.BackgroundColor3 = isActive ? C.surface : C.bg;
 	tabFrame.BackgroundTransparency = isActive ? 0 : 0.5;
@@ -132,7 +214,7 @@ function createTabButton(connIndex: number) {
 	label.Size = new UDim2(1, -26, 1, 0);
 	label.Position = new UDim2(0, 14, 0, 0);
 	label.BackgroundTransparency = 1;
-	label.Text = tostring(conn.port);
+	label.Text = getTabLabel(conn);
 	label.TextColor3 = isActive ? C.label : C.muted;
 	label.TextSize = 10;
 	label.Font = Enum.Font.GothamMedium;
@@ -204,6 +286,7 @@ switchToTab = (index: number) => {
 
 	elements.urlInput.Text = conn.serverUrl;
 	updateUIState();
+	updateServerRegistry(lastRegistryInstances, conn.port);
 };
 
 function updateTabDot(connIndex: number) {
@@ -211,6 +294,49 @@ function updateTabDot(connIndex: number) {
 	if (tb && tb.dot) {
 		tb.dot.BackgroundColor3 = getStatusDotColor(connIndex);
 	}
+	const conn = State.getConnection(connIndex);
+	if (tb && tb.label && conn) {
+		tb.label.Text = getTabLabel(conn);
+	}
+}
+
+function updateServerRegistry(instances: RegistryInstance[], currentPort?: number) {
+	lastRegistryInstances = instances;
+	if (!elements) return;
+
+	const activeConn = State.getActiveConnection();
+	const contextPort = currentPort ?? activeConn?.port;
+
+	let currentPlace = "none";
+	if (contextPort !== undefined) {
+		const currentInstance = instances.find((inst) => inst.port === contextPort);
+		if (currentInstance?.pluginMetadata?.placeName) {
+			currentPlace = currentInstance.pluginMetadata.placeName;
+		}
+	}
+
+	if (contextPort !== undefined) {
+		elements.currentContextLabel.Text = `Current context: ${contextPort} | place: ${currentPlace}`;
+	} else {
+		elements.currentContextLabel.Text = "Current context: none";
+	}
+
+	if (instances.size() === 0) {
+		elements.serverListLabel.Text = "No running MCP servers discovered.";
+		return;
+	}
+
+	const rows: string[] = [];
+	const maxRows = math.min(instances.size(), 8);
+	for (let i = 0; i < maxRows; i++) {
+		const inst = instances[i];
+		const place = inst.pluginMetadata?.placeName ?? "none";
+		const marker = inst.port === contextPort ? ">" : " ";
+		const pluginState = inst.pluginConnected ? "plugin:on" : "plugin:off";
+		rows.push(`${marker} ${inst.port} | ${pluginState} | ${place}`);
+	}
+
+	elements.serverListLabel.Text = rows.join("\n");
 }
 
 function init(pluginRef: Plugin) {
@@ -223,7 +349,9 @@ function init(pluginRef: Plugin) {
 	(screenGui as unknown as { Title: string }).Title = `MCP Server v${CURRENT_VERSION}`;
 
 	const mainFrame = new Instance("Frame");
-	mainFrame.Size = new UDim2(1, 0, 1, 0);
+	mainFrame.AnchorPoint = MAIN_FRAME_FINAL_ANCHOR;
+	mainFrame.Position = MAIN_FRAME_FINAL_POSITION;
+	mainFrame.Size = MAIN_FRAME_FINAL_SIZE;
 	mainFrame.BackgroundColor3 = C.bg;
 	mainFrame.BorderSizePixel = 0;
 	mainFrame.Parent = screenGui;
@@ -522,6 +650,31 @@ function init(pluginRef: Plugin) {
 	troubleshootLabel.LayoutOrder = 4;
 	troubleshootLabel.Parent = card;
 
+	const currentContextLabel = new Instance("TextLabel");
+	currentContextLabel.Size = new UDim2(1, 0, 0, 14);
+	currentContextLabel.BackgroundTransparency = 1;
+	currentContextLabel.Text = "Current context: none";
+	currentContextLabel.TextColor3 = C.dim;
+	currentContextLabel.TextSize = 9;
+	currentContextLabel.Font = Enum.Font.GothamMedium;
+	currentContextLabel.TextXAlignment = Enum.TextXAlignment.Left;
+	currentContextLabel.TextWrapped = true;
+	currentContextLabel.LayoutOrder = 5;
+	currentContextLabel.Parent = card;
+
+	const serverListLabel = new Instance("TextLabel");
+	serverListLabel.Size = new UDim2(1, 0, 0, 56);
+	serverListLabel.BackgroundTransparency = 1;
+	serverListLabel.Text = "No running MCP servers discovered.";
+	serverListLabel.TextColor3 = C.dim;
+	serverListLabel.TextSize = 9;
+	serverListLabel.Font = Enum.Font.GothamMedium;
+	serverListLabel.TextXAlignment = Enum.TextXAlignment.Left;
+	serverListLabel.TextYAlignment = Enum.TextYAlignment.Top;
+	serverListLabel.TextWrapped = true;
+	serverListLabel.LayoutOrder = 6;
+	serverListLabel.Parent = card;
+
 	const connectButton = new Instance("TextButton");
 	connectButton.Size = new UDim2(1, 0, 0, 28);
 	connectButton.BackgroundColor3 = C.surface;
@@ -531,7 +684,7 @@ function init(pluginRef: Plugin) {
 	connectButton.TextColor3 = C.white;
 	connectButton.TextSize = 11;
 	connectButton.Font = Enum.Font.GothamBold;
-	connectButton.LayoutOrder = 5;
+	connectButton.LayoutOrder = 7;
 	connectButton.Parent = card;
 
 	const connectCorner = new Instance("UICorner");
@@ -570,7 +723,7 @@ function init(pluginRef: Plugin) {
 		screenGui, mainFrame, contentFrame, statusLabel, detailStatusLabel,
 		statusIndicator, statusPulse, statusText, connectButton, connectStroke,
 		urlInput, step1Dot, step1Label, step2Dot, step2Label, step3Dot, step3Label,
-		troubleshootLabel, updateBanner, updateBannerText, tabBar,
+		troubleshootLabel, currentContextLabel, serverListLabel, updateBanner, updateBannerText, tabBar,
 	};
 
 	refreshTabBar();
@@ -633,7 +786,11 @@ export = {
 	init,
 	updateUIState,
 	updateTabDot,
+	updateServerRegistry,
+	refreshTabBar: () => refreshTabBar(),
 	stopPulseAnimation,
 	startPulseAnimation,
 	getElements: () => elements,
+	setScreenGuiVisible,
+	toggleScreenGuiVisible,
 };

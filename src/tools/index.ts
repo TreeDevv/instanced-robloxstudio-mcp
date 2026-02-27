@@ -1,11 +1,25 @@
 import { StudioHttpClient } from './studio-client.js';
 import { BridgeService } from '../bridge-service.js';
+import { InstanceRegistry } from '../instance-registry.js';
+
+interface InstanceContext {
+  instanceId: string;
+  host: string;
+  port: number;
+}
 
 export class RobloxStudioTools {
   private client: StudioHttpClient;
+  private registry?: InstanceRegistry;
+  private instanceContext?: InstanceContext;
 
-  constructor(bridge: BridgeService) {
+  constructor(bridge: BridgeService, registry?: InstanceRegistry) {
     this.client = new StudioHttpClient(bridge);
+    this.registry = registry;
+  }
+
+  setInstanceContext(instanceId: string, host: string, port: number) {
+    this.instanceContext = { instanceId, host, port };
   }
 
 
@@ -671,6 +685,41 @@ export class RobloxStudioTools {
         {
           type: 'text',
           text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
+
+  async listMcpInstances() {
+    const instances = this.registry
+      ? await this.registry.listInstances()
+      : [];
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            currentInstanceId: this.instanceContext?.instanceId ?? null,
+            instances
+          }, null, 2)
+        }
+      ]
+    };
+  }
+
+  async getMcpInstanceContext() {
+    const current = this.registry && this.instanceContext
+      ? await this.registry.getInstance(this.instanceContext.instanceId)
+      : null;
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            instance: current ?? this.instanceContext ?? null
+          }, null, 2)
         }
       ]
     };
